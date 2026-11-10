@@ -8,8 +8,9 @@ const envSchema = z.object({
   PORT: z.string().default('3000').transform(val => parseInt(val, 10)),
   NODE_ENV: z.enum(['development', 'production', 'test']).default('development'),
   PRIMARY_MODEL: z.string().default('north-mini-code:free'),
-  BACKUP_MODEL: z.string().default('recursive/flint-v1.0:free'),
-OPENROUTER_API_KEY: z.string().min(1, 'OPENAI_API_KEY is required')
+  BACKUP_MODEL:  z.string().default('recursive/flint-v1.0:free'),
+  JINA_API_KEY:  z.string().min(1, 'JINA_API_KEY is required'),
+  OPENROUTER_API_KEY: z.string().min(1, 'OPENAI_API_KEY is required')
 });
 
 const result = envSchema.safeParse(process.env);
