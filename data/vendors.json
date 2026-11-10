@@ -1,0 +1,19 @@
+[
+  {
+    "id": "demo-store",
+    "name": "Demo Apparel & Goods",
+    "platform": "shopify",
+    "storeUrl": "https://demo-store.myshopify.com",
+    "allowedOrigins": ["https://example.com", "http://localhost:3000"],
+    "currency": "USD",
+    "widgetConfig": {
+      "title": "AI Shopping Assistant",
+      "primaryColor": "#000000",
+      "welcomeMessage": "Hi! Looking for something specific today?"
+    },
+    "limits": {
+      "messagesPerVisitorPerHour": 30,
+      "monthlyAiCallCap": 5000
+    }
+  }
+]
