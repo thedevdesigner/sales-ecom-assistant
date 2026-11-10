@@ -1,10 +1,10 @@
 [
   {
-    "id": "demo-store",
+    "id": "nordic-knives",
     "name": "Demo Apparel & Goods",
     "platform": "shopify",
-    "storeUrl": "https://demo-store.myshopify.com",
-    "allowedOrigins": ["https://example.com", "http://localhost:3000"],
+    "storeUrl": "https://nordic-knives.myshopify.com",
+    "allowedOrigins": ["https://nordic-knives.myshopify.com","https://nordicknives.com/", "http://localhost:3000"],
     "currency": "USD",
     "widgetConfig": {
       "title": "AI Shopping Assistant",
