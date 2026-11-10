@@ -4,7 +4,7 @@
     "name": "nordic knives",
     "platform": "shopify",
     "storeUrl": "https://nordic-knives.myshopify.com",
-    "allowedOrigins": ["https://nordic-knives.myshopify.com","https://nordicknives.com/", "http://localhost:3000"],
+    "allowedOrigins": ["https://nordic-knives.myshopify.com","https://nordicknives.com/","https://www.nordicknives.com","http://localhost:3000"],
     "currency": "USD",
     "widgetConfig": {
       "title": "AI Shopping Assistant",
