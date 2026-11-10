@@ -1,7 +1,7 @@
 [
   {
     "id": "nordic-knives",
-    "name": "Demo Apparel & Goods",
+    "name": "nordic knives",
     "platform": "shopify",
     "storeUrl": "https://nordic-knives.myshopify.com",
     "allowedOrigins": ["https://nordic-knives.myshopify.com","https://nordicknives.com/", "http://localhost:3000"],

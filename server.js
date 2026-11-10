@@ -4,9 +4,11 @@ import { env } from './src/config/env.js';
 import { loadVendors } from './src/loaders/vendorLoader.js';
 import configRouter from './src/routes/config.js';
 import chatRouter from './src/routes/chat.js';
+import cors from 'cors'
 
 const app = express();
 app.use(helmet());
+app.use(cors())
 app.use(express.json({ limit: '10kb' }));
 
 loadVendors();
