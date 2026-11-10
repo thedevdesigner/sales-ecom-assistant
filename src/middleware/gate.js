@@ -16,24 +16,14 @@ export function gateMiddleware(req, res, next) {
     return res.status(404).json({ error: { code: 404, message: 'Vendor not found' } });
   }
 
-  // 1. Origin & CORS check
-  const origin = req.headers.origin || req.headers.referer;
-  const isAllowedOrigin = vendor.allowedOrigins.some(allowed => {
-    if (!origin) return false;
-    return origin.startsWith(allowed);
-  });
+  // 1. Origin check. CORS response headers are handled by cors() in index.js; this only decides who may use the vendor.
+  const toOrigin = (v) => { try { return new URL(v).origin; } catch { return null; } };
+  const requestOrigin = toOrigin(req.headers.origin || req.headers.referer || '');
+  const allowedOrigins = (vendor.allowedOrigins || []).map(toOrigin).filter(Boolean);
+  const isAllowedOrigin = Boolean(requestOrigin) && allowedOrigins.includes(requestOrigin);
 
   if (!isAllowedOrigin && process.env.NODE_ENV === 'production') {
     return res.status(403).json({ error: { code: 403, message: 'Origin not allowed by vendor policy' } });
-  }
-
-  const allowedOriginHeader = isAllowedOrigin ? origin : vendor.allowedOrigins[0];
-  res.setHeader('Access-Control-Allow-Origin', allowedOriginHeader || '*');
-  res.setHeader('Access-Control-Allow-Methods', 'GET, POST, OPTIONS');
-  res.setHeader('Access-Control-Allow-Headers', 'Content-Type, Authorization');
-
-  if (req.method === 'OPTIONS') {
-    return res.status(204).end();
   }
 
   // 2. Monthly AI Call Cap Check

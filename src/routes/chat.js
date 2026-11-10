@@ -15,7 +15,14 @@ router.post('/', gateMiddleware, validateBody(chatBodySchema), async (req, res) 
 
     // --- Step B. QUIET-STATE & STRIKE CHECK ---
     const activeStrikes = getCombinedStrikes(sessionId, clientIp, clientStrikes);
-    const quietCheck = await evaluateQuietState(latestMessage, req.vendor, activeStrikes, sessionId, clientIp);
+
+    // A short reply inside an ongoing, clean conversation (e.g. tapping "Party") is never off-topic
+    const isFollowUp =
+      messages.length > 1 &&
+      activeStrikes === 0 &&
+      latestMessage.trim().split(/\s+/).length <= 5;
+
+    const quietCheck = await evaluateQuietState(latestMessage, req.vendor, activeStrikes, sessionId, clientIp, { isFollowUp });
 
     if (!quietCheck.bypassQuiet) {
       return res.status(200).json({

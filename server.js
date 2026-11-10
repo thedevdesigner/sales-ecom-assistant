@@ -7,9 +7,13 @@ import chatRouter from './src/routes/chat.js';
 import cors from 'cors'
 
 const app = express();
-app.use(helmet());
-app.use(cors())
-app.use(express.json({ limit: '10kb' }));
+app.set('trust proxy', 1);
+app.use(helmet({ crossOriginResourcePolicy: { policy: 'cross-origin' } }));
+app.use(cors({
+  origin: true,       // Dynamically echoes back the requesting origin
+  credentials: true   // Allows cookies/auth headers from unknown domains
+}))
+app.use(express.json({ limit: '10kb', type: ['application/json', 'text/plain'] }));
 
 loadVendors();
 
@@ -19,7 +23,11 @@ app.get('/health', (req, res) => {
 
 app.use('/config', configRouter);
 app.use('/chat', chatRouter);
-
+app.use((req, res) => res.status(404).json({ error: 'not_found' }));
+app.use((err, req, res, next) => {
+  console.error('request error:', err);
+  res.status(err.status || 500).json({ error: 'server_error' });
+});
 app.listen(env.PORT, () => {
   console.log(`Server running on port ${env.PORT} in ${env.NODE_ENV} mode`);
 });
