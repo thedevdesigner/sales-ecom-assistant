@@ -1,5 +1,20 @@
 import { generateAICompletion } from '../services/aiClient.js';
 
+// ---------------------------------------------------------------------------
+// NOTE (streaming refactor): this file needs NO logic changes.
+//
+// Every reply it produces is a fixed template string, so the route simply
+// sends it as a single delta on the stream:
+//     sink.meta({ products: [], state, strikes });
+//     sink.delta(quietCheck.reply);
+//     sink.done({ state, strikes });
+//
+// One genuine gap that streaming exposes: the strike-3 short-message
+// classifier below makes the client WAIT on an AI call before ANY byte is
+// written. With streaming you could instead send a "thinking..." delta first
+// (or a meta frame with {state:'checking'}) — optional, cost-free polish.
+// ---------------------------------------------------------------------------
+
 // Server-side in-memory strike store (TTL ~30 minutes)
 const serverStrikesMap = new Map(); // Key: `${sessionId}:${ip}` -> { strikes, timestamp }
 const TTL_MS = 30 * 60 * 1000;
@@ -12,6 +27,10 @@ setInterval(() => {
   }
 }, 10 * 60 * 1000).unref();
 
+// GAP (pre-existing, unrelated to streaming): this Map is per-process.
+// If you ever run more than one Node instance, strikes reset randomly
+// depending on which instance serves the request. Migrate to Redis or a
+// shared store keyed by `${sessionId}:${ip}` when you scale.
 export function getCombinedStrikes(sessionId, clientIp, clientStrikes) {
   const key = `${sessionId}:${clientIp}`;
   const now = Date.now();

@@ -1,4 +1,4 @@
-import { generateStructuredAIResponse, generateAICompletion } from '../services/aiClient.js';
+import { generateStructuredAIResponse, generateAICompletion, generateAICompletionStream } from '../services/aiClient.js';
 import { searchProducts } from '../adapters/platformDetector.js';
 import { z } from 'zod';
 
@@ -20,8 +20,22 @@ const understandSchema = z.object({
   unclear: z.boolean()
 });
 
-export async function runChatPipeline(vendor, messages) {
-  // Step C. UNDERSTAND (AI Call 1)
+/**
+ * Steps C–H.
+ *
+ * @param vendor
+ * @param messages
+ * @param sink   OPTIONAL. When provided, the pipeline streams:
+ *                 sink.meta({products, chips}) BEFORE the reply, then
+ *                 sink.delta(...) per token, then sink.done({state, strikes}).
+ *               When omitted, behaves exactly like the old monolithic
+ *               version and returns { reply, products, state, strikes, chips? }.
+ *
+ * @returns the same result object as before (reply is the full text).
+ */
+export async function runChatPipeline(vendor, messages, sink = null) {
+  // Step C. UNDERSTAND (AI Call 1) — structured output CANNOT stream;
+  // it must complete before we know whether to search products at all.
   const understandMessages = [
     {
       role: 'system',
@@ -37,11 +51,12 @@ export async function runChatPipeline(vendor, messages) {
     intentData = { intent: 'product_search', productType: messages[messages.length - 1]?.content || '', unclear: false };
   }
 
+  // Fixed-string paths: stream as a single delta if a sink is attached.
   if (intentData.intent === 'off_topic' || intentData.intent === 'chitchat') {
     const reply = intentData.intent === 'chitchat'
       ? `Hello! I'm your shopping assistant here at ${vendor.name}. What can I help you find today?`
       : `I focus specifically on helping you find products here at ${vendor.name}. What are you shopping for?`;
-    return { reply, products: [], state: 'normal', strikes: 0 };
+    return emitAndReturn(sink, reply, []);
   }
 
   // Step D. FETCH (No AI)
@@ -76,7 +91,11 @@ export async function runChatPipeline(vendor, messages) {
     chips = ["Browse bestsellers", "View new arrivals", "Contact support"];
   }
 
-  // Step G. REPLY (AI Call 2)
+  // --- METADATA GOES OUT FIRST ---
+  // The client can render product cards / chips while the text is typing.
+  if (sink) sink.meta({ products, chips, state: 'normal', strikes: 0 });
+
+  // Step G. REPLY (AI Call 2) — THIS is the step that streams.
   const replyMessages = [
     {
       role: 'system',
@@ -88,20 +107,41 @@ export async function runChatPipeline(vendor, messages) {
     }
   ];
 
-  let replyText;
+  let replyText = '';
   try {
-    replyText = await generateAICompletion(replyMessages, false);
+    if (sink && typeof generateAICompletionStream === 'function') {
+      replyText = await generateAICompletionStream(replyMessages, {
+        onDelta: (text) => sink.delta(text),
+        isAborted: () => sink.aborted
+      });
+    } else {
+      replyText = await generateAICompletion(replyMessages, false);
+      sink?.delta(replyText); // graceful degradation: one big "chunk"
+    }
   } catch (err) {
     replyText = products.length > 0
       ? `Here are some great options I found matching what you're looking for at ${vendor.name}:`
       : `I couldn't find an exact match right now, but feel free to explore our main categories!`;
+    sink?.delta(replyText);
   }
 
-  return {
+  const result = {
     reply: replyText,
     products,
     state: 'normal',
     strikes: 0,
     ...(chips.length > 0 ? { chips } : {})
   };
+
+  if (sink) sink.done({ state: 'normal', strikes: 0 });
+  return result;
+}
+
+function emitAndReturn(sink, reply, products) {
+  if (sink) {
+    sink.meta({ products, chips: [], state: 'normal', strikes: 0 });
+    sink.delta(reply);
+    sink.done({ state: 'normal', strikes: 0 });
+  }
+  return { reply, products, state: 'normal', strikes: 0 };
 }
