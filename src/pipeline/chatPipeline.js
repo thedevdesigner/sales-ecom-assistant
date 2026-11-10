@@ -1,136 +1,125 @@
-import { generateStructuredAIResponse, generateAICompletion, generateAICompletionStream } from '../services/aiClient.js';
-import { searchProducts } from '../adapters/platformDetector.js';
-import { z } from 'zod';
+import { generateAICompletion, generateAICompletionStream } from '../services/aiClient.js';
+import { searchShopifyProducts } from '../adapters/shopifyAdapter.js';
+import { scrapeProductDetails } from '../adapters/productScraper.js';
 
-const understandSchema = z.object({
-  intent: z.enum(['product_search', 'store_info', 'followup', 'chitchat', 'off_topic']),
-  productType: z.string().optional(),
-  budget: z.object({
-    min: z.number().nullable().optional(),
-    max: z.number().nullable().optional()
-  }).optional(),
-  preferences: z.object({
-    color: z.string().optional(),
-    size: z.string().optional(),
-    brand: z.string().optional(),
-    flavor: z.string().optional(),
-    other: z.string().optional()
-  }).optional(),
-  purpose: z.string().optional(),
-  unclear: z.boolean()
-});
+const agentTools = [
+  {
+    type: "function",
+    function: {
+      name: "search_products",
+      description: "Search the store catalog when the user explicitly asks to find, list, filter, or buy products. Never use this for general conversation.",
+      parameters: {
+        type: "object",
+        properties: {
+          query: { type: "string", description: "Clean target product keyword (e.g. 'knife'). Do not include budget text." },
+          maxPrice: { type: "number", description: "Maximum budget filter in store currency." },
+          minPrice: { type: "number", description: "Minimum budget filter in store currency." },
+          color: { type: "string", description: "Color variant if specified." },
+          sortBy: { type: "string", enum: ["price_asc", "price_desc", "newest", "relevance"] }
+        },
+        required: ["query"]
+      }
+    }
+  },
+  {
+    type: "function",
+    function: {
+      name: "scrape_product_details",
+      description: "Scrape and read deep product page specs/content using Jina AI when comparing products or answering specific technical questions about an item.",
+      parameters: {
+        type: "object",
+        properties: {
+          productUrl: { type: "string", description: "The full URL of the product page to inspect." }
+        },
+        required: ["productUrl"]
+      }
+    }
+  }
+];
 
-/**
- * Steps C–H.
- *
- * @param vendor
- * @param messages
- * @param sink   OPTIONAL. When provided, the pipeline streams:
- *                 sink.meta({products, chips}) BEFORE the reply, then
- *                 sink.delta(...) per token, then sink.done({state, strikes}).
- *               When omitted, behaves exactly like the old monolithic
- *               version and returns { reply, products, state, strikes, chips? }.
- *
- * @returns the same result object as before (reply is the full text).
- */
 export async function runChatPipeline(vendor, messages, sink = null) {
-  // Step C. UNDERSTAND (AI Call 1) — structured output CANNOT stream;
-  // it must complete before we know whether to search products at all.
-  const understandMessages = [
-    {
-      role: 'system',
-      content: 'You are an e-commerce intent parser. Analyze the recent shopper conversation and output strict JSON matching the schema: intent (product_search, store_info, followup, chitchat, off_topic), productType, budget ({min, max}), preferences ({color, size, brand, flavor, other}), purpose, unclear (boolean).'
-    },
-    ...messages.slice(-6)
-  ];
+  const storeUrl = vendor.storeUrl || `https://${vendor.domain || 'nordicknives.com'}`;
 
-  let intentData;
-  try {
-    intentData = await generateStructuredAIResponse(understandMessages, understandSchema);
-  } catch (err) {
-    intentData = { intent: 'product_search', productType: messages[messages.length - 1]?.content || '', unclear: false };
-  }
+  const systemMessage = {
+    role: "system",
+    content: `You are an expert sales assistant for ${vendor.name}.
+- You have access to search tools and a web page reader tool.
+- DO NOT call search tools or scrapers unless the user is explicitly asking to view, find, filter, or compare products.
+- For general conversation, questions, greetings, or policies, reply naturally without calling tools (products array should be empty).
+- When searching products, pass clean keywords to 'query' and put numerical limits in 'maxPrice' or 'minPrice'. Never invent products or prices.`
+  };
 
-  // Fixed-string paths: stream as a single delta if a sink is attached.
-  if (intentData.intent === 'off_topic' || intentData.intent === 'chitchat') {
-    const reply = intentData.intent === 'chitchat'
-      ? `Hello! I'm your shopping assistant here at ${vendor.name}. What can I help you find today?`
-      : `I focus specifically on helping you find products here at ${vendor.name}. What are you shopping for?`;
-    return emitAndReturn(sink, reply, []);
-  }
+  const conversationHistory = [systemMessage, ...messages.slice(-8)];
 
-  // Step D. FETCH (No AI)
-  const searchQuery = intentData.productType || vendor.name;
-  const rawProducts = await searchProducts(vendor, searchQuery);
-
-  // Step E. FILTER AND RANK (No AI)
-  let products = [...rawProducts];
-
-  if (intentData.budget?.max) {
-    products = products.filter(p => p.price <= intentData.budget.max);
-  }
-  if (intentData.budget?.min) {
-    products = products.filter(p => p.price >= intentData.budget.min);
-  }
-
-  if (intentData.preferences?.color) {
-    const col = intentData.preferences.color.toLowerCase();
-    products = products.filter(p => p.title.toLowerCase().includes(col));
-  }
-
-  products.sort((a, b) => {
-    if (a.inStock !== b.inStock) return a.inStock ? -1 : 1;
-    return 0;
+  // STEP 1: Let OpenAI evaluate the conversation and decide whether to call a tool
+  const initialMessage = await generateAICompletion(conversationHistory, {
+    tools: agentTools,
+    tool_choice: "auto"
   });
 
-  products = products.slice(0, 4);
+  let productsToDeliver = [];
+  let updatedHistory = [...conversationHistory];
 
-  // Step F. ZERO-RESULT & ALTERNATIVE LOGIC
-  let chips = [];
-  if (products.length === 0) {
-    chips = ["Browse bestsellers", "View new arrivals", "Contact support"];
+  // STEP 2: Check if OpenAI invoked tool calls
+  if (initialMessage.tool_calls && initialMessage.tool_calls.length > 0) {
+    updatedHistory.push(initialMessage); // Record assistant's tool call intent
+
+    for (const toolCall of initialMessage.tool_calls) {
+      const funcName = toolCall.function.name;
+      const args = JSON.parse(toolCall.function.arguments || '{}');
+      let toolResult = null;
+
+      if (funcName === "search_products") {
+        // Search using your high-performance adapter with accurate price constraints
+        productsToDeliver = await searchShopifyProducts(storeUrl, args, vendor.currency || 'USD');
+        toolResult = productsToDeliver;
+      } 
+      else if (funcName === "scrape_product_details") {
+        // Fetch clean markdown page content via Jina AI
+        toolResult = await scrapeProductDetails(args.productUrl);
+      }
+
+      // Feed the tool data back into the conversation history for OpenAI to read
+      updatedHistory.push({
+        role: "tool",
+        tool_call_id: toolCall.id,
+        content: JSON.stringify(toolResult)
+      });
+    }
+  } else {
+    // No tools called: Pure conversation mode
+    const directReply = initialMessage.content || '';
+    return emitAndReturn(sink, directReply, []);
   }
 
-  // --- METADATA GOES OUT FIRST ---
-  // The client can render product cards / chips while the text is typing.
-  if (sink) sink.meta({ products, chips, state: 'normal', strikes: 0 });
+  // STEP 3: Send metadata frame to frontend carousel if products were found
+  if (sink && productsToDeliver.length > 0) {
+    sink.meta({ products: productsToDeliver.slice(0, 8), chips: [], state: 'normal', strikes: 0 });
+  }
 
-  // Step G. REPLY (AI Call 2) — THIS is the step that streams.
-  const replyMessages = [
-    {
-      role: 'system',
-      content: `You are a friendly sales assistant for ${vendor.name}. Write 1 to 3 friendly sentences responding to the shopper. You may mention ONLY the provided real products. If a constraint or fact is not in the product data, state that it isn't listed and suggest checking the product page. Never invent facts.`
-    },
-    {
-      role: 'user',
-      content: `Shopper request: "${messages[messages.length - 1].content}"\nAvailable products matching constraints: ${JSON.stringify(products)}`
-    }
-  ];
-
-  let replyText = '';
+  // STEP 4: Stream the final response back to the widget based on the tool results
+  let finalReplyText = '';
   try {
     if (sink && typeof generateAICompletionStream === 'function') {
-      replyText = await generateAICompletionStream(replyMessages, {
+      finalReplyText = await generateAICompletionStream(updatedHistory, {
         onDelta: (text) => sink.delta(text),
         isAborted: () => sink.aborted
       });
     } else {
-      replyText = await generateAICompletion(replyMessages, false);
-      sink?.delta(replyText); // graceful degradation: one big "chunk"
+      const finalMsg = await generateAICompletion(updatedHistory);
+      finalReplyText = typeof finalMsg === 'string' ? finalMsg : finalMsg.content;
+      sink?.delta(finalReplyText);
     }
   } catch (err) {
-    replyText = products.length > 0
-      ? `Here are some great options I found matching what you're looking for at ${vendor.name}:`
-      : `I couldn't find an exact match right now, but feel free to explore our main categories!`;
-    sink?.delta(replyText);
+    finalReplyText = "Here are the options I found matching your request:";
+    sink?.delta(finalReplyText);
   }
 
   const result = {
-    reply: replyText,
-    products,
+    reply: finalReplyText,
+    products: productsToDeliver.slice(0, 8),
     state: 'normal',
-    strikes: 0,
-    ...(chips.length > 0 ? { chips } : {})
+    strikes: 0
   };
 
   if (sink) sink.done({ state: 'normal', strikes: 0 });
