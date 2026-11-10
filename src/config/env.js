@@ -1,21 +1,16 @@
 import dotenv from 'dotenv';
 import { z } from 'zod';
 
-// Load environment variables from .env file via dotenv third-party package
+// Load environment variables from .env file
 dotenv.config();
 
 const envSchema = z.object({
   PORT: z.string().default('3000').transform(val => parseInt(val, 10)),
   NODE_ENV: z.enum(['development', 'production', 'test']).default('development'),
-  PRIMARY_MODEL: z.string().min(1),
-  BACKUP_MODEL: z.string().min(1),
-  OPENROUTER_API_KEY: z.string().min(1)
+  PRIMARY_MODEL: z.string().default('north-mini-code:free'),
+  BACKUP_MODEL: z.string().default('recursive/flint-v1.0:free'),
+OPENROUTER_API_KEY: z.string().min(1, 'OPENAI_API_KEY is required')
 });
-export const env = {
-  OPENAI_API_KEY: process.env.OPENAI_API_KEY,
-  PRIMARY_MODEL: process.env.PRIMARY_MODEL,
-  BACKUP_MODEL: process.env.BACKUP_MODEL
-};
 
 const result = envSchema.safeParse(process.env);
 
@@ -24,4 +19,5 @@ if (!result.success) {
   process.exit(1);
 }
 
+// Single clean export of validated environment variables
 export const env = result.data;
