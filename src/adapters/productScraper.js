@@ -1,6 +1,7 @@
 import { env } from '../config/env.js';
 
 export async function scrapeProductDetails(productUrl) {
+  console.log("🚨 [TOOL EXECUTED] scrapeProductDetails called with args:");
   try {
     // Clean target URL and prepend Jina Reader
     const targetUrl = productUrl.startsWith('http') ? productUrl : `https://${productUrl}`;

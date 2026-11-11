@@ -29,9 +29,9 @@ router.post('/', gateMiddleware, validateBody(chatBodySchema), async (req, res) 
   try {
     const { messages, sessionId, strikes: clientStrikes } = req.validatedBody;
     const clientIp = req.ip || req.socket.remoteAddress;
-    const latestMessage = messages[messages.length - 1].content;
+    const latestMessage = messages[messages.length - 1]?.content || '';
 
-    // --- Step B. QUIET-STATE & STRIKE CHECK (same logic as before) ---
+    // --- Step B. QUIET-STATE & STRIKE CHECK ---
     const activeStrikes = getCombinedStrikes(sessionId, clientIp, clientStrikes);
 
     const isFollowUp =
@@ -42,38 +42,40 @@ router.post('/', gateMiddleware, validateBody(chatBodySchema), async (req, res) 
     const quietCheck = await evaluateQuietState(latestMessage, req.vendor, activeStrikes, sessionId, clientIp, { isFollowUp });
 
     if (!quietCheck.bypassQuiet) {
-      // Warned / quiet replies are fixed strings: meta -> one delta -> done
       sink.meta({ products: [], state: quietCheck.state, strikes: quietCheck.strikes });
       sink.delta(quietCheck.reply);
       sink.done({ state: quietCheck.state, strikes: quietCheck.strikes });
       return sink.end();
     }
 
-    // --- Steps C through H (streams meta, deltas, done internally) ---
-    await runChatPipeline(req.vendor, messages, sink);
-
-    if (req.incrementAiUsage) {
+    // --- Run Pipeline with Streaming Sink ---
+    const result = await runChatPipeline(req.vendor, messages, sink);
+  console.log(result)
+    if (typeof req.incrementAiUsage === 'function') {
       req.incrementAiUsage();
     }
 
-    sink.end();
+    // Ensure sink is ended if pipeline didn't close it explicitly
+    if (!sink.ended) {
+      sink.end();
+    }
   } catch (err) {
-    // Headers already sent -> CANNOT res.status(500).json anymore.
-    // The only honest channel left is an error frame on the stream.
     logger.error('Chat endpoint streaming error', { error: err.message, stack: err.stack });
-    sink.error("I'm having a little trouble connecting to our catalog right now. Please try again in a moment!");
-    sink.end();
+    if (!res.headersSent) {
+      sink.error("I'm having a little trouble connecting to our catalog right now. Please try again in a moment!");
+      sink.end();
+    }
   }
 });
 
 /**
- * The original behavior, preserved verbatim for non-streaming clients.
+ * Legacy behavior for non-streaming clients.
  */
 async function handleLegacy(req, res) {
   try {
     const { messages, sessionId, strikes: clientStrikes } = req.validatedBody;
     const clientIp = req.ip || req.socket.remoteAddress;
-    const latestMessage = messages[messages.length - 1].content;
+    const latestMessage = messages[messages.length - 1]?.content || '';
 
     const activeStrikes = getCombinedStrikes(sessionId, clientIp, clientStrikes);
 
@@ -93,20 +95,23 @@ async function handleLegacy(req, res) {
       });
     }
 
-    const result = await runChatPipeline(req.vendor, messages);
+    // Run pipeline without a sink (returns full result object)
+    const result = await runChatPipeline(req.vendor, messages, null);
 
-    if (req.incrementAiUsage) {
+    if (typeof req.incrementAiUsage === 'function') {
       req.incrementAiUsage();
     }
 
-    res.status(200).json({
-      ...result,
-      state: 'normal',
-      strikes: 0
+    return res.status(200).json({
+      reply: result.reply,
+      products: result.products || [],
+      state: result.state || 'normal',
+      strikes: result.strikes || 0,
+      ...(result.chips ? { chips: result.chips } : {})
     });
   } catch (err) {
     logger.error('Chat endpoint execution error', { error: err.message, stack: err.stack });
-    res.status(500).json({
+    return res.status(500).json({
       reply: "I'm having a little trouble connecting to our catalog right now. Please try again in a moment!",
       products: [],
       state: 'normal',

@@ -1,25 +1,9 @@
 import { generateAICompletion } from '../services/aiClient.js';
 
-// ---------------------------------------------------------------------------
-// NOTE (streaming refactor): this file needs NO logic changes.
-//
-// Every reply it produces is a fixed template string, so the route simply
-// sends it as a single delta on the stream:
-//     sink.meta({ products: [], state, strikes });
-//     sink.delta(quietCheck.reply);
-//     sink.done({ state, strikes });
-//
-// One genuine gap that streaming exposes: the strike-3 short-message
-// classifier below makes the client WAIT on an AI call before ANY byte is
-// written. With streaming you could instead send a "thinking..." delta first
-// (or a meta frame with {state:'checking'}) — optional, cost-free polish.
-// ---------------------------------------------------------------------------
-
 // Server-side in-memory strike store (TTL ~30 minutes)
 const serverStrikesMap = new Map(); // Key: `${sessionId}:${ip}` -> { strikes, timestamp }
 const TTL_MS = 30 * 60 * 1000;
 
-// Purge expired records so the map never grows without limit
 setInterval(() => {
   const now = Date.now();
   for (const [key, rec] of serverStrikesMap) {
@@ -27,10 +11,6 @@ setInterval(() => {
   }
 }, 10 * 60 * 1000).unref();
 
-// GAP (pre-existing, unrelated to streaming): this Map is per-process.
-// If you ever run more than one Node instance, strikes reset randomly
-// depending on which instance serves the request. Migrate to Redis or a
-// shared store keyed by `${sessionId}:${ip}` when you scale.
 export function getCombinedStrikes(sessionId, clientIp, clientStrikes) {
   const key = `${sessionId}:${clientIp}`;
   const now = Date.now();
@@ -40,8 +20,6 @@ export function getCombinedStrikes(sessionId, clientIp, clientStrikes) {
   if (record && now - record.timestamp < TTL_MS) {
     serverStrikes = record.strikes;
   }
-
-  // Use the stricter (higher) of client vs server strikes
   return Math.max(serverStrikes, Number(clientStrikes) || 0);
 }
 
@@ -56,51 +34,27 @@ export function resetStrikes(sessionId, clientIp) {
   serverStrikesMap.delete(`${sessionId}:${clientIp}`);
 }
 
-/* ---------- Free (no-AI) topic detection ---------- */
-
-// Whole-word matches only, so "hi" can no longer match "this" or "machine"
-const GENERIC = /\b(buy|purchase|price|prices|pricing|cheap|cheaper|cheapest|expensive|under|below|budget|deal|deals|sale|discount|cost|how much|do you have|do you sell|recommend|suggest|looking for|need|want|show me|find|compare|best|bestseller|bestsellers|gift|available|availability|in stock|stock|size|sizes|color|colour|shipping|delivery|return|returns|refund|warranty|policy|order|product|products|shop|store|catalog|category|categories)\b/i;
 const GREETING = /^\s*(hi|hello|hey|hiya|good (morning|afternoon|evening)|thanks|thank you|thx|ok|okay)\b/i;
 const INJECTION = /(ignore|disregard|forget) (all |your |any |the |previous |prior )*(instructions|rules|prompts?)|system prompt|reveal your (prompt|instructions)|override (your|the|all)|jailbreak|developer mode/i;
 
-const kwCache = new Map(); // vendor.id -> RegExp | null
-
-function vendorRegex(vendor) {
-  if (!kwCache.has(vendor.id)) {
-    const words = [vendor.name, ...(vendor.keywords || [])]
-      .filter(Boolean)
-      .map((w) => String(w).replace(/[.*+?^${}()|[\]\\]/g, '\\$&'));
-    kwCache.set(vendor.id, words.length ? new RegExp(`\\b(${words.join('|')})`, 'i') : null);
-  }
-  return kwCache.get(vendor.id);
-}
-
-// Accepts a vendor object (preferred) or, for backward compatibility, a vendor name string
-export function hasShoppingSignal(messageText, vendor) {
-  const v = typeof vendor === 'string' ? { id: vendor, name: vendor } : vendor || {};
-  const text = String(messageText || '');
-  return GENERIC.test(text) || Boolean(vendorRegex(v)?.test(text));
-}
-
 /**
- * opts.isFollowUp: true when this is a short reply inside an ongoing, on-topic
- * conversation (e.g. tapping a chip like "Party"). These never earn a strike.
+ * DYNAMIC INTENT EVALUATION:
+ * Instead of rigid keyword lists, we check for explicit greetings/injections,
+ * then use a fast AI intent classifier to verify if the user's message is a 
+ * product or shopping inquiry.
  */
 export async function evaluateQuietState(messageText, vendor, activeStrikes, sessionId, clientIp, opts = {}) {
-  const text = String(messageText || '');
+  const text = String(messageText || '').trim();
   const injection = INJECTION.test(text);
 
-  // On-topic: greetings, store questions, shopping words, the store's own product words, short follow-ups
-  if (!injection && (GREETING.test(text) || opts.isFollowUp || hasShoppingSignal(text, vendor))) {
+  // 1. Always allow greetings, ongoing conversational follow-ups, or prompt injections (handled separately)
+  if (!injection && (GREETING.test(text) || opts.isFollowUp)) {
     resetStrikes(sessionId, clientIp);
     return { state: 'normal', strikes: 0, bypassQuiet: true };
   }
 
-  // Off-topic or injection attempt: count a strike
-  const newStrikes = recordStrike(sessionId, clientIp, activeStrikes);
-
-  // Injection attempts get a short neutral line, no friendly coaching
   if (injection) {
+    const newStrikes = recordStrike(sessionId, clientIp, activeStrikes);
     return {
       state: newStrikes >= 3 ? 'quiet' : 'warned',
       strikes: newStrikes,
@@ -109,6 +63,27 @@ export async function evaluateQuietState(messageText, vendor, activeStrikes, ses
       products: []
     };
   }
+
+  // 2. DYNAMIC AI INTENT CHECK: Ask the model if this is a shopping/product query
+  try {
+    const classifierPrompt = `You are a strict intent gatekeeper for an e-commerce store named "${vendor.name}". 
+Determine if the user's message is related to shopping, finding products, catalog browsing, pricing, shipping, or store inquiries.
+Answer ONLY with "YES" if it's shopping/product related, or "NO" if it's completely off-topic (e.g., coding help, math, general trivia, politics).
+Message: ${JSON.stringify(text.slice(0, 300))}`;
+
+    const verdict = await generateAICompletion([{ role: 'user', content: classifierPrompt }], { jsonMode: false });
+    
+    if (String(verdict).toUpperCase().includes('YES')) {
+      resetStrikes(sessionId, clientIp);
+      return { state: 'normal', strikes: 0, bypassQuiet: true };
+    }
+  } catch (err) {
+    // Fallback if classifier errors: bypass to let pipeline handle it rather than blocking a customer
+    return { state: 'normal', strikes: 0, bypassQuiet: true };
+  }
+
+  // 3. If evaluated as truly off-topic, process strikes normally
+  const newStrikes = recordStrike(sessionId, clientIp, activeStrikes);
 
   if (newStrikes === 1 || newStrikes === 2) {
     return {
@@ -130,22 +105,6 @@ export async function evaluateQuietState(messageText, vendor, activeStrikes, ses
     };
   }
 
-  // Beyond strike 3 (quiet state). The free shopping check already ran above, so the only
-  // second chance is ONE tiny AI classification, for short ambiguous messages.
-  if (text.trim().split(/\s+/).length <= 6) {
-    try {
-      const classifierPrompt = `Is this message related to shopping or a product inquiry? Answer ONLY with YES or NO.\nMessage: ${JSON.stringify(text.slice(0, 200))}`;
-      const verdict = await generateAICompletion([{ role: 'user', content: classifierPrompt }], false);
-      if (String(verdict).toUpperCase().includes('YES')) {
-        resetStrikes(sessionId, clientIp);
-        return { state: 'normal', strikes: 0, bypassQuiet: true };
-      }
-    } catch (err) {
-      // If the classifier fails, stay quiet
-    }
-  }
-
-  // Quiet state reply (zero cost, fixed message)
   return {
     state: 'quiet',
     strikes: newStrikes,
