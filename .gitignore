@@ -41,5 +41,5 @@ Thumbs.db
 *.sln
 *.swp
 *.swo
-frontend.js
 readme.md
+.wrangler

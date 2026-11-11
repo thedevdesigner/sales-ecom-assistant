@@ -1,5 +1,5 @@
 import { generateAICompletion, generateAICompletionStream } from '../services/aiClient.js';
-import { searchShopifyProducts } from '../adapters/shopifyAdapter.js';
+import { searchShopifyProducts, discoverStorePages } from '../adapters/shopifyAdapter.js';
 import { scrapeProductDetails } from '../adapters/productScraper.js';
 import { logger } from '../utils/logger.js';
 
@@ -8,14 +8,14 @@ const agentTools = [
     type: "function",
     function: {
       name: "search_products",
-      description: "Search store catalog for PURCHASE intent (e.g., 'do you have X?', looking for items under a price, or asking to see/buy products).",
+      description: "Search store catalog for PURCHASE intent (e.g., 'do you have X?', items under a price limit, or asking to buy products).",
       parameters: {
         type: "object",
         properties: {
           query: { type: "string", description: "Clean target product keyword." },
           maxPrice: { type: "number", description: "Maximum budget limit." },
           minPrice: { type: "number", description: "Minimum budget limit." },
-          limit: { type: "number", description: "Set to 1 if user is asking for a specific single product, or more for browsing." }
+          limit: { type: "number", description: "Set to 1 for a single specific item, or more for browsing." }
         },
         required: ["query"]
       }
@@ -24,8 +24,22 @@ const agentTools = [
   {
     type: "function",
     function: {
+      name: "discover_store_pages",
+      description: "MANDATORY FOR INQUIRIES. Discover official store pages (policies, refund, return, shipping, terms, contact) by keyword. NEVER answer policy questions from memory without checking first.",
+      parameters: {
+        type: "object",
+        properties: {
+          keyword: { type: "string", description: "Keyword to search (e.g., 'refund', 'shipping', 'contact', 'terms')" }
+        },
+        required: ["keyword"]
+      }
+    }
+  },
+  {
+    type: "function",
+    function: {
       name: "scrape_product_details",
-      description: "Scrape and read deep product specs or company 'about' info via Jina AI for INQUIRY or COMPARISON intent.",
+      description: "Scrape and read deep page content or policy text via Jina AI for INQUIRY intent.",
       parameters: {
         type: "object",
         properties: {
@@ -39,45 +53,90 @@ const agentTools = [
 
 export async function runChatPipeline(vendor, messages, sink = null) {
   const storeUrl = vendor.storeUrl || `https://${vendor.domain || 'nordicknives.com'}`;
+  
+  // Extract latest user query
+  const lastUserMsg = [...messages].reverse().find(m => m.role === 'user')?.content || '';
+  const normalizedUserQuery = lastUserMsg.toLowerCase().trim();
 
+  let productsToDeliver = [];
+  let chips = [];
+  let intent = 'inquiry';
+  let contextInjected = false;
+
+  // ---------------------------------------------------------------------------
+  // 1. DETERMINISTIC PRE-ROUTER (Bypasses LLM Parametric Laziness completely)
+  // ---------------------------------------------------------------------------
+  const policyRegex = /(refund|return|policy|shipping|deliver|terms|privacy|contact|support|about|faq)/i;
+  
+  if (policyRegex.test(normalizedUserQuery)) {
+    let kw = 'policy';
+    if (/refund|return/.test(normalizedUserQuery)) kw = 'refund';
+    else if (/shipping|deliver/.test(normalizedUserQuery)) kw = 'shipping';
+    else if (/contact|support|reach/.test(normalizedUserQuery)) kw = 'contact';
+    else if (/terms|condition/.test(normalizedUserQuery)) kw = 'terms';
+
+    try {
+      logger.info(`⚡ [Pre-Router] Intercepted policy inquiry. Discovering paths for: "${kw}"`);
+      const discoveredPages = await discoverStorePages(storeUrl, kw);
+      
+      if (discoveredPages && discoveredPages.length > 0) {
+        const targetUrl = discoveredPages[0];
+        logger.info(`⚡ [Pre-Router] Scraping live context from: ${targetUrl}`);
+        const scraped = await scrapeProductDetails(targetUrl);
+        
+        if (scraped && scraped.content && !scraped.error) {
+          // Force-inject live scraped context into system context
+          messages.push({
+            role: "system",
+            content: `[OFFICIAL VERIFIED STORE CONTEXT FROM ${targetUrl}]:\n${scraped.content}\n\n[INSTRUCTION]: Answer the user's inquiry strictly based on the verified context above. Keep products [] empty.`
+          });
+          contextInjected = true;
+        }
+      }
+    } catch (preRouterErr) {
+      logger.error('[Pre-Router] Execution failed, falling back to agent tool selection', { error: preRouterErr.message });
+    }
+  }
+
+  // ---------------------------------------------------------------------------
+  // 2. SYSTEM PROMPT & FEW-SHOT INSTRUCTION SCALPEL
+  // ---------------------------------------------------------------------------
   const systemMessage = {
     role: "system",
     content: `You are an expert sales assistant for ${vendor.name}. Classify every user message into one of three strict intents and handle it accordingly:
 
 1. **INQUIRY**: 
-   - User asks about company trust, policies, background ("Is this company trusted?", "What is your return policy?"), or general product information/how-tos without asking to buy or see catalog items.
-   - **Rule**: Do not trigger product carousels. Answer via text (use scraper if checking about/policy pages). \`products\` must be empty \`[]\`.
+   - User asks about company trust, policies, background ("Is this company trusted?", "What is your return policy?"), or general info.
+   - **Rule**: NEVER guess or answer policies from pre-trained knowledge. If official store context is injected in system messages, summarize it directly. Otherwise, call \`discover_store_pages\`, then \`scrape_product_details\`. \`products\` must be empty \`[]\`.
 
 2. **PURCHASE**: 
    - User wants to buy, asks if an item is in stock ("Do you have..."), or gives a budget ("under $100").
-   - **Rule**: Call \`search_products\`. If looking for a single specific item, return 1 product card. If browsing a category, return matching items for a carousel.
+   - **Rule**: Call \`search_products\`. Return 1 item if specific, or up to 8 if browsing.
 
 3. **COMPARISON**: 
    - User wants to compare two or more specific items.
-   - **Rule**: Fetch the compared items. Label them clearly in your reply text (e.g. Option A vs Option B) so the user can easily contrast them.
+   - **Rule**: Fetch compared items and contrast Option A vs Option B in text reply.
 
-- NEVER output raw JSON, code blocks, or markdown code formatting in your reply text. 
-- Always ensure speech matches reality: if \`totalFound === 0\`, politely state we don't have it in stock without inventing items or brands.`
+- NEVER output raw JSON, code blocks, or markdown code formatting in your reply text.`
   };
 
   const conversationHistory = [systemMessage, ...messages.slice(-8)];
-
-  let productsToDeliver = [];
-  let chips = [];
-  let intent = 'inquiry'; // default fallback
   let updatedHistory = [...conversationHistory];
 
   try {
-    const initialResponse = await generateAICompletion(conversationHistory, {
+    let currentResponse = await generateAICompletion(conversationHistory, {
       tools: agentTools,
-      tool_choice: "auto"
+      tool_choice: contextInjected ? "none" : "auto" // Skip tool overhead if context was pre-routed
     });
 
-    const assistantMessage = typeof initialResponse === 'string'
-      ? { role: 'assistant', content: initialResponse }
-      : initialResponse;
+    let iterations = 0;
+    // Multi-turn tool execution loop (allows discovering paths -> then scraping)
+    while (currentResponse?.tool_calls && currentResponse.tool_calls.length > 0 && iterations < 2) {
+      iterations++;
+      const assistantMessage = typeof currentResponse === 'string'
+        ? { role: 'assistant', content: currentResponse }
+        : currentResponse;
 
-    if (assistantMessage?.tool_calls && assistantMessage.tool_calls.length > 0) {
       updatedHistory.push(assistantMessage);
 
       for (const toolCall of assistantMessage.tool_calls) {
@@ -97,10 +156,17 @@ export async function runChatPipeline(vendor, messages, sink = null) {
         try {
           if (funcName === "search_products") {
             intent = 'purchase';
-            const searchResults = await searchShopifyProducts(storeUrl, args, vendor.currency || 'USD');
+            
+            // Normalize generic browse/bestseller terms to fetch available active catalog items
+            let cleanQuery = args.query || '';
+            const genericBrowseRegex = /(bestseller|best seller|popular|sale|new|catalog|browse|recommend)/i;
+            if (genericBrowseRegex.test(cleanQuery)) {
+              cleanQuery = ''; 
+            }
+
+            const searchResults = await searchShopifyProducts(storeUrl, { ...args, query: cleanQuery, inStockOnly: true }, vendor.currency || 'USD');
             let rawProducts = Array.isArray(searchResults) ? searchResults : [];
             
-            // If user asked for a single item or limit is 1, isolate top 1 result
             if (args.limit === 1 && rawProducts.length > 0) {
               productsToDeliver = [rawProducts[0]];
             } else {
@@ -114,11 +180,19 @@ export async function runChatPipeline(vendor, messages, sink = null) {
             };
 
             if (productsToDeliver.length === 0) {
-              chips = ["Browse bestsellers", "View new arrivals", "Contact support"];
+              chips = ["Browse catalog", "View new arrivals", "Contact support"];
             }
           } 
+          else if (funcName === "discover_store_pages") {
+            intent = 'inquiry';
+            const discoveredPages = await discoverStorePages(storeUrl, args.keyword || '');
+            toolResult = {
+              status: discoveredPages.length > 0 ? 'FOUND' : 'EMPTY_RESULTS',
+              pages: discoveredPages
+            };
+          }
           else if (funcName === "scrape_product_details") {
-            intent = 'inquiry'; // or comparison depending on context
+            intent = 'inquiry';
             const scrapedData = await scrapeProductDetails(args.productUrl);
             toolResult = { status: 'FOUND', details: scrapedData };
           }
@@ -134,10 +208,21 @@ export async function runChatPipeline(vendor, messages, sink = null) {
           content: JSON.stringify(toolResult ?? {})
         });
       }
-    } else {
-      intent = 'inquiry';
-      const directReply = assistantMessage.content || "How can I help you today?";
-      return emitAndReturn(sink, directReply, [], chips, intent);
+
+      // If tools were called, check if the model wants to call more tools or if we reached max iterations
+      if (iterations < 2) {
+        currentResponse = await generateAICompletion(updatedHistory, {
+          tools: agentTools,
+          tool_choice: "auto"
+        });
+      } else {
+        break;
+      }
+    }
+
+    // If the model produced a direct text response without tool calls initially, push it safely
+    if (currentResponse?.content && (!currentResponse.tool_calls || currentResponse.tool_calls.length === 0)) {
+      updatedHistory.push(currentResponse);
     }
 
     if (sink) {
@@ -152,6 +237,7 @@ export async function runChatPipeline(vendor, messages, sink = null) {
 
     let finalReplyText = '';
     try {
+      // If history ends with tool calls or user messages, generate stream directly
       if (sink && typeof generateAICompletionStream === 'function') {
         finalReplyText = await generateAICompletionStream(updatedHistory, {
           onDelta: (text) => sink.delta(text),
@@ -166,14 +252,14 @@ export async function runChatPipeline(vendor, messages, sink = null) {
       logger.error('[Pipeline] Final response generation failed', { error: streamErr.message });
       finalReplyText = productsToDeliver.length > 0
         ? `Here are the options I found for you at ${vendor.name}:`
-        : `I'm sorry, we don't currently have that item in stock. Feel free to explore our catalog!`;
+        : `I'm happy to assist you with any questions regarding ${vendor.name}'s products or policies!`;
       if (sink) sink.delta(finalReplyText);
     }
 
     if (!finalReplyText || !finalReplyText.trim()) {
       finalReplyText = productsToDeliver.length > 0
         ? `Here are the options I found for you at ${vendor.name}:`
-        : `I'm sorry, we don't currently have any items matching that request in stock at ${vendor.name}.`;
+        : `I'm happy to assist you with any questions regarding ${vendor.name}'s products or policies!`;
       if (sink) sink.delta(finalReplyText);
     }
 
