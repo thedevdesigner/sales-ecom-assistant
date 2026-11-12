@@ -52,6 +52,7 @@ const agentTools = [
 ];
 
 export async function runChatPipeline(vendor, messages, sink = null) {
+  console.time('⏱️ Total Pipeline Time')
   const storeUrl = vendor.storeUrl || `https://${vendor.domain || 'nordicknives.com'}`;
   
   // Extract latest user query
@@ -179,9 +180,9 @@ export async function runChatPipeline(vendor, messages, sink = null) {
             if (genericBrowseRegex.test(cleanQuery)) {
               cleanQuery = ''; 
             }
-
+            console.time('⏱️ Vector Search / Product Lookup');
             const searchResults = await searchShopifyProducts(storeUrl, { ...args, query: cleanQuery, inStockOnly: true }, vendor.currency || 'USD');
-            
+            console.timeEnd('⏱️ Vector Search / Product Lookup');
             updateStatus('Filtering in-stock items...');
             let rawProducts = Array.isArray(searchResults) ? searchResults : [];
             
@@ -260,12 +261,16 @@ export async function runChatPipeline(vendor, messages, sink = null) {
     let finalReplyText = '';
     try {
       if (sink && typeof generateAICompletionStream === 'function') {
+        console.time('⏱️ LLM Token Generation / Response');
         finalReplyText = await generateAICompletionStream(updatedHistory, {
           onDelta: (text) => sink.delta(text),
           isAborted: () => sink.aborted
         });
+      console.timeEnd('⏱️ LLM Token Generation / Response')
       } else {
+        console.time('⏱️ LLM Token Generation / Response');
         const finalMsg = await generateAICompletion(updatedHistory);
+        console.timeEnd('⏱️ LLM Token Generation / Response')
         finalReplyText = typeof finalMsg === 'string' ? finalMsg : finalMsg?.content || '';
         if (sink) sink.delta(finalReplyText);
       }
@@ -301,6 +306,7 @@ export async function runChatPipeline(vendor, messages, sink = null) {
     const fallbackMessage = "I'm having a little trouble connecting right now. Please try again in a moment!";
     return emitAndReturn(sink, fallbackMessage, [], ["Try again", "View catalog"], 'inquiry');
   }
+  console.timeEnd('⏱️ Total Pipeline Time');
 }
 
 function emitAndReturn(sink, reply, products, chips = [], intent = 'inquiry') {
