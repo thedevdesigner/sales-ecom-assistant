@@ -3,6 +3,10 @@ import { searchShopifyProducts, discoverStorePages } from '../adapters/shopifyAd
 import { scrapeProductDetails } from '../adapters/productScraper.js';
 import { logger } from '../utils/logger.js';
 
+// logger.warn may not exist in your logger: calling it threw a TypeError that escaped the pipeline and left the stream open forever
+const warn = (...a) => (typeof logger.warn === 'function' ? logger.warn(...a) : logger.error(...a));
+const DEADLINE_MS = Number(process.env.CHAT_DEADLINE_MS) || 25000;   // the request can never stay pending longer than this
+
 /**
  * Strict timeout wrapper for external store/scraper operations.
  * Fails fast to prevent socket hanging and streaming stalls.
@@ -26,6 +30,7 @@ const agentTools = [
         properties: {
           query: { type: "string", description: "Specific product keyword. Never pass empty or generic terms." },
           maxPrice: { type: "number", description: "Maximum budget limit." },
+          minPrice: { type: "number", description: "Minimum budget limit." },
           limit: { type: "number", description: "Number of items to fetch (max 8)." }
         },
         required: ["query"]
@@ -62,7 +67,8 @@ const agentTools = [
   }
 ];
 
-export async function runChatPipeline(vendor, messages, sink = null) {
+async function runInner(vendor, rawMessages, sink = null) {
+  const messages = rawMessages.map((m) => ({ ...m }));   // never mutate the caller's array
   const storeUrl = vendor.storeUrl || `https://${vendor.domain || 'nordicknives.com'}`;
   const storeName = vendor.name || 'this store';
   const lastUserMsg = [...messages].reverse().find(m => m.role === 'user')?.content || '';
@@ -80,7 +86,7 @@ export async function runChatPipeline(vendor, messages, sink = null) {
   // ---------------------------------------------------------------------------
   // 1. FAST-PATH POLICY PRE-ROUTER (Wrapped with Timeout)
   // ---------------------------------------------------------------------------
-  const policyRegex = /(refund|return|policy|shipping|deliver|terms|privacy|contact|support|about|faq)/i;
+  const policyRegex = /\b(refunds?|returns?|polic(?:y|ies)|shipping|delivery|terms|privacy|contact|faq)\b/i;
   
   if (policyRegex.test(normalizedUserQuery)) {
     let kw = 'policy';
@@ -108,7 +114,7 @@ export async function runChatPipeline(vendor, messages, sink = null) {
         }
       }
     } catch (e) {
-      logger.warn('[Pre-Router] Policy check skipped due to timeout/error', { error: e.message });
+      warn('[Pre-Router] Policy check skipped due to timeout/error', { error: e.message });
     }
   }
 
@@ -131,10 +137,11 @@ Follow these core rules strictly:
   try {
     updateStatus('Analyzing request...');
     
-    let initialResponse = await generateAICompletion(conversationHistory, contextInjected ? {} : {
+    let initialResponse = await withAdapterTimeout(generateAICompletion(conversationHistory, contextInjected ? {} : {
       tools: agentTools,
       tool_choice: "auto"
-    });
+    }), 12000, null);
+    if (initialResponse === null) throw new Error('AI call timed out');
 
     let usedTools = false;
 
@@ -168,7 +175,7 @@ Follow these core rules strictly:
               
               // 🔑 8-SECOND TIMEOUT GUARD ON SHOPIFY CATALOG SEARCH
               const searchResults = await withAdapterTimeout(
-                searchShopifyProducts(storeUrl, { query: cleanQuery, inStockOnly: true, limit: args.limit || 6 }, vendor.currency || 'USD'),
+                searchShopifyProducts(storeUrl, { query: cleanQuery, maxPrice: args.maxPrice, minPrice: args.minPrice, inStockOnly: true, limit: args.limit || 6 }, vendor.currency || 'USD'),
                 8000,
                 []
               );
@@ -262,5 +269,44 @@ Follow these core rules strictly:
       sink.done({ state: 'normal', strikes: 0 });
     }
     return { reply: fallbackMessage, intent: 'inquiry', products: [], state: 'normal', strikes: 0 };
+  }
+}
+
+/**
+ * Public entry point. Guarantees the stream is ALWAYS finished:
+ *  - any exception, including ones thrown before the main try block, is caught
+ *  - a hard deadline (25 s) ends the turn with a friendly message instead of leaving the request pending
+ *  - late writes from slow background work are ignored once the turn is closed
+ */
+export async function runChatPipeline(vendor, rawMessages, sink = null) {
+  let closed = false, metaSent = false;
+  const guard = sink && {
+    get aborted() { return sink.aborted; },
+    status: (t) => { if (!closed) sink.status?.(t); },
+    meta: (d) => { if (!closed) { metaSent = true; sink.meta(d); } },
+    delta: (t) => { if (!closed) sink.delta(t); },
+    done: (d) => { if (!closed) { closed = true; sink.done(d); } },
+  };
+  const FALLBACK = "Sorry, that is taking longer than expected. Please try again in a moment.";
+  const finish = (reason) => {
+    logger.error('[Pipeline] ended early', { reason });
+    if (guard && !closed) {
+      if (!metaSent) guard.meta({ intent: 'inquiry', products: [], chips: ['Try again'], state: 'normal', strikes: 0 });
+      guard.delta(FALLBACK);
+      guard.done({ state: 'normal', strikes: 0 });
+    }
+    closed = true;
+    return { reply: FALLBACK, intent: 'inquiry', products: [], state: 'normal', strikes: 0, aiCalls: 1 };
+  };
+
+  let timer;
+  const deadline = new Promise((resolve) => { timer = setTimeout(() => resolve('deadline'), DEADLINE_MS); });
+  try {
+    const result = await Promise.race([runInner(vendor, rawMessages, guard), deadline]);
+    return result === 'deadline' ? finish('deadline') : { aiCalls: 1, ...result };
+  } catch (err) {
+    return finish(err.message);
+  } finally {
+    clearTimeout(timer);
   }
 }
