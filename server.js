@@ -10,9 +10,11 @@ const app = express();
 app.set('trust proxy', 1);
 app.use(helmet({ crossOriginResourcePolicy: { policy: 'cross-origin' } }));
 app.use(cors({
-  origin: true,       // Dynamically echoes back the requesting origin
-  credentials: true   // Allows cookies/auth headers from unknown domains
-}))
+  origin: '*',
+  methods: ['GET', 'POST', 'OPTIONS'],
+  allowedHeaders: ['Content-Type', 'Accept', 'skip_zrok_interstitial']
+}));
+app.options('*', cors());
 app.use(express.json({ limit: '10kb', type: ['application/json', 'text/plain'] }));
 
 loadVendors();
