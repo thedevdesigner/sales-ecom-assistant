@@ -3,6 +3,18 @@ import { searchShopifyProducts, discoverStorePages } from '../adapters/shopifyAd
 import { scrapeProductDetails } from '../adapters/productScraper.js';
 import { logger } from '../utils/logger.js';
 
+/**
+ * Strict timeout wrapper for external store/scraper operations.
+ * Fails fast to prevent socket hanging and streaming stalls.
+ */
+async function withAdapterTimeout(promise, ms = 8000, fallback = null) {
+  let timer;
+  const timeout = new Promise((resolve) => {
+    timer = setTimeout(() => resolve(fallback), ms);
+  });
+  return Promise.race([promise, timeout]).finally(() => clearTimeout(timer));
+}
+
 const agentTools = [
   {
     type: "function",
@@ -66,7 +78,7 @@ export async function runChatPipeline(vendor, messages, sink = null) {
   };
 
   // ---------------------------------------------------------------------------
-  // 1. FAST-PATH POLICY PRE-ROUTER
+  // 1. FAST-PATH POLICY PRE-ROUTER (Wrapped with Timeout)
   // ---------------------------------------------------------------------------
   const policyRegex = /(refund|return|policy|shipping|deliver|terms|privacy|contact|support|about|faq)/i;
   
@@ -78,10 +90,14 @@ export async function runChatPipeline(vendor, messages, sink = null) {
 
     try {
       updateStatus('Checking store policies...');
-      const discoveredPages = await discoverStorePages(storeUrl, kw);
+      // 6-second max timeout for page discovery
+      const discoveredPages = await withAdapterTimeout(discoverStorePages(storeUrl, kw), 6000, []);
+      
       if (discoveredPages && discoveredPages.length > 0) {
         updateStatus('Reading official policy page...');
-        const scraped = await scrapeProductDetails(discoveredPages[0]);
+        // 6-second max timeout for policy scraping
+        const scraped = await withAdapterTimeout(scrapeProductDetails(discoveredPages[0]), 6000, null);
+        
         if (scraped && scraped.content && !scraped.error) {
           messages.push({
             role: "system",
@@ -92,7 +108,7 @@ export async function runChatPipeline(vendor, messages, sink = null) {
         }
       }
     } catch (e) {
-      logger.warn('[Pre-Router] Policy check skipped', { error: e.message });
+      logger.warn('[Pre-Router] Policy check skipped due to timeout/error', { error: e.message });
     }
   }
 
@@ -101,22 +117,11 @@ export async function runChatPipeline(vendor, messages, sink = null) {
     content: `You are an expert, helpful AI shopping assistant for ${storeName}. 
 
 Follow these core rules strictly:
-1. **GREETINGS & GENERAL INQUIRIES** (e.g., "Hello", "Hi, can you help me?"):
-   - Respond warmly and directly as the store's shopping assistant. Explain how you can help (finding specific products, comparing items, or checking store policies). Do NOT call any tools.
-
-2. **BEST-SELLER / POPULARITY REQUESTS** (e.g., "What are your bestsellers?", "Show me top selling items"):
-   - Store sales volumes and best-seller rankings are not publicly listed in the catalog.
-   - Politely inform the user that best-selling rankings aren't listed, and ask what specific product type or category they are looking for. Do NOT call "search_products".
-
-3. **PURCHASE & PRODUCT SEARCH**:
-   - When the user asks for a specific product name or category, call "search_products" with a clear keyword. Never pass vague or empty terms like "catalog", "all", or "bestsellers".
-
-4. **INQUIRY (POLICIES & SUPPORT)**:
-   - Use verified policy context or discover/scrape store pages. Keep products empty.
-
-5. **OFF-TOPIC**:
-   - Politely decline in 1 sentence and pivot back to helping them shop at ${storeName}.
-
+1. **GREETINGS & GENERAL INQUIRIES**: Respond warmly and directly. Do NOT call any tools.
+2. **BEST-SELLER REQUESTS**: Politely inform the user that best-selling rankings aren't listed, and ask for a specific category. Do NOT call "search_products".
+3. **PURCHASE & PRODUCT SEARCH**: Call "search_products" with a clear keyword.
+4. **INQUIRY**: Use verified policy context or discover/scrape store pages.
+5. **OFF-TOPIC**: Decline politely in 1 sentence and pivot back to shopping.
 - Never output raw JSON, code blocks, or markdown code formatting in your reply text.`
   };
 
@@ -125,17 +130,20 @@ Follow these core rules strictly:
 
   try {
     updateStatus('Analyzing request...');
-    let currentResponse = await generateAICompletion(conversationHistory, contextInjected ? {} : {
+    
+    let initialResponse = await generateAICompletion(conversationHistory, contextInjected ? {} : {
       tools: agentTools,
       tool_choice: "auto"
     });
 
-    // Single-turn tool execution guard
-    if (currentResponse?.tool_calls && currentResponse.tool_calls.length > 0) {
-      const assistantMessage = currentResponse;
-      updatedHistory.push(assistantMessage);
+    let usedTools = false;
 
-      for (const toolCall of assistantMessage.tool_calls) {
+    // Single-turn tool execution guard
+    if (initialResponse?.tool_calls && initialResponse.tool_calls.length > 0) {
+      usedTools = true;
+      updatedHistory.push(initialResponse);
+
+      for (const toolCall of initialResponse.tool_calls) {
         const funcName = toolCall.function.name;
         let args = {};
         try { args = JSON.parse(toolCall.function.arguments || '{}'); } catch(e){}
@@ -157,7 +165,13 @@ Follow these core rules strictly:
             } else {
               updateStatus('Searching catalog...');
               console.time('⏱️ Vector Search / Product Lookup');
-              const searchResults = await searchShopifyProducts(storeUrl, { query: cleanQuery, inStockOnly: true, limit: args.limit || 6 }, vendor.currency || 'USD');
+              
+              // 🔑 8-SECOND TIMEOUT GUARD ON SHOPIFY CATALOG SEARCH
+              const searchResults = await withAdapterTimeout(
+                searchShopifyProducts(storeUrl, { query: cleanQuery, inStockOnly: true, limit: args.limit || 6 }, vendor.currency || 'USD'),
+                8000,
+                []
+              );
               console.timeEnd('⏱️ Vector Search / Product Lookup');
 
               productsToDeliver = Array.isArray(searchResults) ? searchResults.slice(0, 6) : [];
@@ -173,19 +187,20 @@ Follow these core rules strictly:
           } 
           else if (funcName === "discover_store_pages") {
             intent = 'inquiry';
-            const discoveredPages = await discoverStorePages(storeUrl, args.keyword || '');
+            // 6-second timeout guard
+            const discoveredPages = await withAdapterTimeout(discoverStorePages(storeUrl, args.keyword || ''), 6000, []);
             toolResult = { status: discoveredPages.length > 0 ? 'FOUND' : 'EMPTY_RESULTS', pages: discoveredPages };
           }
           else if (funcName === "scrape_product_details") {
             intent = 'inquiry';
-            const scrapedData = await scrapeProductDetails(args.productUrl);
-            toolResult = { status: 'FOUND', details: scrapedData };
+            // 8-second timeout guard
+            const scrapedData = await withAdapterTimeout(scrapeProductDetails(args.productUrl), 8000, { error: 'Timeout' });
+            toolResult = { status: scrapedData && !scrapedData.error ? 'FOUND' : 'EMPTY_RESULTS', details: scrapedData };
           }
         } catch (toolErr) {
           logger.error(`[Pipeline] Tool execution error '${funcName}'`, { error: toolErr.message });
         }
 
-        // CRITICAL FIX: Include tool_call_id so aiClient correctly maps the response back to Gemini
         updatedHistory.push({
           role: "tool",
           tool_call_id: toolCall.id,
@@ -193,15 +208,9 @@ Follow these core rules strictly:
           content: JSON.stringify(toolResult)
         });
       }
-
-      updateStatus('Synthesizing answer...');
-      currentResponse = await generateAICompletion(updatedHistory);
     }
 
-    if (currentResponse?.content) {
-      updatedHistory.push(currentResponse);
-    }
-
+    // Emit metadata frame once products and chips are resolved
     if (sink) {
       sink.meta({ intent, products: productsToDeliver, chips, state: 'normal', strikes: 0 });
     }
@@ -209,7 +218,11 @@ Follow these core rules strictly:
     updateStatus('Streaming response...');
     let finalReplyText = '';
     
-    if (sink && typeof generateAICompletionStream === 'function') {
+    // Fast path for non-tool queries (greetings, policies) to avoid duplicate roundtrips
+    if (!usedTools && typeof initialResponse === 'string' && initialResponse.trim()) {
+      finalReplyText = initialResponse;
+      if (sink) sink.delta(finalReplyText);
+    } else if (sink && typeof generateAICompletionStream === 'function') {
       console.time('⏱️ LLM Token Generation / Response');
       finalReplyText = await generateAICompletionStream(updatedHistory, {
         onDelta: (text) => sink.delta(text),
@@ -217,7 +230,7 @@ Follow these core rules strictly:
       });
       console.timeEnd('⏱️ LLM Token Generation / Response');
     } else {
-      const finalMsg = typeof currentResponse === 'string' ? currentResponse : (currentResponse?.content || await generateAICompletion(updatedHistory));
+      const finalMsg = typeof initialResponse === 'string' ? initialResponse : await generateAICompletion(updatedHistory);
       finalReplyText = typeof finalMsg === 'string' ? finalMsg : finalMsg?.content || '';
       if (sink) sink.delta(finalReplyText);
     }

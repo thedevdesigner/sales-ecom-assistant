@@ -1,47 +1,153 @@
 <!DOCTYPE html>
 <html lang="en">
 <head>
-    <meta charset="UTF-8">
-    <meta name="viewport" content="width=device-width, initial-scale=1.0">
-    <title>Document</title>
+  <meta charset="UTF-8">
+  <title>AI Shopping Assistant Test</title>
+  <style>
+    body { font-family: sans-serif; max-width: 600px; margin: 40px auto; padding: 20px; }
+    #chat-box { border: 1px solid #ccc; padding: 15px; height: 300px; overflow-y: scroll; margin-bottom: 10px; background: #f9f9f9; }
+    .product-card { background: #fff; border: 1px solid #ddd; padding: 10px; margin: 5px 0; border-radius: 4px; }
+  </style>
 </head>
 <body>
-    <script>
-(async () => {
-  console.log("🚀 Testing direct /chat POST connection...");
-  try {
-    const res = await fetch('https://sales-ecom-assistant.onrender.com/chat', {
-      method: 'POST',
-      headers: {
-        'Content-Type': 'application/json',
-        'Accept': 'application/octet-stream'
-      },
-      body: JSON.stringify({
-        vendorId: 'nordic-knives',
-        sessionId: 'test-123',
-        pageUrl: location.href, // <--- ADDED THIS LINE
-        messages: [{ role: 'user', content: 'i am looking for latest collection you have' }],
-        stream: true
-      })
-    });
-    
-    console.log("📥 Response status:", res.status);
-    console.log("📥 Response headers:", [...res.headers.entries()]);
 
-    if (!res.ok) {
-      console.error("❌ /chat rejected the request:", await res.text());
-      return;
+  <h2>AI Shopping Assistant Stream Test</h2>
+  <div id="chat-box"></div>
+  <input type="text" id="user-input" placeholder="Ask about products or policies..." style="width: 75%; padding: 8px;" />
+  <button id="send-btn" style="width: 20%; padding: 8px;">Send</button>
+
+  <script>
+    const chatBox = document.getElementById('chat-box');
+    const inputField = document.getElementById('user-input');
+    const sendBtn = document.getElementById('send-btn');
+
+    // Maintain conversation history for multi-turn chat
+    let conversationHistory = [];
+
+    async function sendQuery(userMessage) {
+      // Append user message to history
+      conversationHistory.push({ role: 'user', content: userMessage });
+
+      appendMessage('You', userMessage);
+      inputField.value = '';
+
+      // Create a container for the assistant's streaming reply
+      const assistantDiv = appendMessage('Assistant', '');
+
+      const payload = {
+        vendorId: 'nordic-knives', // Replace with your active vendor ID
+        sessionId: 'browser-session-123',
+        pageUrl: window.location.href,
+        messages: conversationHistory
+      };
+
+      try {
+        const response = await fetch('https://sales-ecom-assistant.onrender.com/chat', {
+          method: 'POST',
+          headers: {
+            'Content-Type': 'application/json',
+            'Accept': 'application/octet-stream' // Crucial: tells Express to stream NDJSON
+          },
+          body: JSON.stringify(payload)
+        });
+
+        if (!response.ok) {
+          throw new Error(`HTTP error! status: ${response.status}`);
+        }
+
+        const reader = response.body.getReader();
+        const decoder = new TextDecoder();
+        let buffer = '';
+        let fullReplyText = '';
+
+        while (true) {
+          const { value, done } = await reader.read();
+          if (done) break;
+
+          // Decode chunk and add to buffer
+          buffer += decoder.decode(value, { stream: true });
+
+          // Split buffer by newline to process complete NDJSON frames
+          let lines = buffer.split('\n');
+          buffer = lines.pop(); // Keep any incomplete trailing line in the buffer
+
+          for (const line of lines) {
+            if (!line.trim()) continue;
+            
+            try {
+              const frame = JSON.parse(line);
+
+              if (frame.event === 'meta') {
+                console.log('📦 Meta data received (Products/Chips):', frame.data);
+                if (frame.data.products && frame.data.products.length > 0) {
+                  renderProducts(frame.data.products);
+                }
+              } 
+              else if (frame.event === 'delta') {
+                // Stream text tokens in real time
+                fullReplyText += frame.data.text;
+                assistantDiv.textContent = fullReplyText;
+                chatBox.scrollTop = chatBox.scrollHeight;
+              } 
+              else if (frame.event === 'done') {
+                console.log('✨ Stream finished successfully.');
+                // Push assistant reply to conversation history
+                conversationHistory.push({ role: 'assistant', content: fullReplyText });
+              }
+              else if (frame.event === 'error') {
+                assistantDiv.textContent = `Error: ${frame.data.message}`;
+              }
+            } catch (parseErr) {
+              console.warn('⚠️ Failed to parse NDJSON frame:', line);
+            }
+          }
+        }
+
+      } catch (err) {
+        console.error('Fetch stream failed:', err);
+        assistantDiv.textContent = 'Connection error. Please try again.';
+      }
     }
 
-    const reader = res.body.getReader();
-    const decoder = new TextDecoder();
-    
-    const { value, done } = await reader.read();
-    console.log("📥 First chunk received:", decoder.decode(value));
-  } catch (err) {
-    console.error("❌ /chat network or CORS failure:", err);
-  }
-})();
-    </script>
+    function appendMessage(sender, text) {
+      const p = document.createElement('div');
+      p.style.margin = '8px 0';
+      p.innerHTML = `<strong>${sender}:</strong> <span>${text}</span>`;
+      chatBox.appendChild(p);
+      chatBox.scrollTop = chatBox.scrollHeight;
+      return p.querySelector('span');
+    }
+
+    function renderProducts(products) {
+      const container = document.createElement('div');
+      container.style.margin = '10px 0';
+      products.forEach(p => {
+        const card = document.createElement('div');
+        card.className = 'product-card';
+        card.innerHTML = `
+          <img src="${p.imageUrl}" width="50" style="float:left; margin-right:10px;" />
+          <strong>${p.title}</strong><br/>
+          <span>${p.price} ${p.currency}</span><br/>
+          <a href="${p.url}" target="_blank">View Product</a>
+        `;
+        container.appendChild(card);
+      });
+      chatBox.appendChild(container);
+      chatBox.scrollTop = chatBox.scrollHeight;
+    }
+
+    sendBtn.addEventListener('click', () => {
+      const text = inputField.value.trim();
+      if (text) sendQuery(text);
+    });
+
+    inputField.addEventListener('keypress', (e) => {
+      if (e.key === 'Enter') {
+        const text = inputField.value.trim();
+        if (text) sendQuery(text);
+      }
+    });
+  </script>
+
 </body>
 </html>
