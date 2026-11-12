@@ -8,54 +8,21 @@ import { logger } from '../utils/logger.js';
 const router = Router();
 
 /**
- * Streaming is OPT-IN so old clients keep working untouched:
- *   POST /api/chat
- *   Header:  Accept: application/octet-stream     (or body { stream: true })
+ * POST /chat
+ * Supports NDJSON streaming (Accept: application/octet-stream or { stream: true })
+ * and legacy JSON responses. All messages, including greetings, flow to the LLM.
  */
 router.post('/', gateMiddleware, validateBody(chatBodySchema), async (req, res) => {
   const wantsStream =
     (req.headers.accept || '').includes('application/octet-stream') ||
     req.validatedBody.stream === true;
 
-  const { messages, sessionId, strikes: clientStrikes } = req.validatedBody;
-  const latestMessage = messages[messages.length - 1]?.content || '';
-
-  // ============ FAST-PATH GREETINGS (Instant response, bypasses LLM delay) ============
-  const greetingRegex = /^(hi|hello|hey|greetings|good morning|good afternoon|good evening)\b/i;
-  if (greetingRegex.test(latestMessage.trim()) && messages.length <= 2) {
-    const greetingReply = {
-      reply: "Hello! How can I help you find the right product today?",
-      intent: 'greeting',
-      products: [],
-      chips: ['Show me bestsellers', "What's on sale?"]
-    };
-
-    if (wantsStream) {
-      const sink = createStreamSink(res);
-      sink.attachAbort(req);
-      try {
-        sink.meta({ 
-          products: greetingReply.products, 
-          chips: greetingReply.chips, 
-          state: greetingReply.intent, 
-          strikes: clientStrikes || 0 
-        });
-        sink.delta(greetingReply.reply);
-        sink.done({ state: 'normal', strikes: clientStrikes || 0 });
-      } catch (err) {
-        sink.error("Failed to render greeting.");
-      }
-      return sink.end();
-    } else {
-      return res.status(200).json(greetingReply);
-    }
-  }
+  const { messages } = req.validatedBody;
 
   if (!wantsStream) {
     return handleLegacy(req, res, messages);
   }
 
-  // ============ STREAMING PATH (Direct to Pipeline) ============
   const sink = createStreamSink(res);
   sink.attachAbort(req);
 
@@ -71,19 +38,17 @@ router.post('/', gateMiddleware, validateBody(chatBodySchema), async (req, res) 
     }
   } catch (err) {
     logger.error('Chat endpoint streaming error', { error: err.message, stack: err.stack });
-    
-    // CRITICAL FIX: Since headers are already sent by createStreamSink, 
-    // we must push an explicit NDJSON error frame instead of checking !res.headersSent!
+
     try {
       sink.error("I'm having a little trouble connecting to our catalog right now. Please try again in a moment!");
     } catch (e) {}
-    
+
     sink.end();
   }
 });
 
 /**
- * Legacy behavior for non-streaming clients (Direct to Pipeline).
+ * Legacy behavior for non-streaming clients.
  */
 async function handleLegacy(req, res, messages) {
   try {

@@ -1,7 +1,6 @@
 import { GoogleGenAI } from '@google/genai';
 import { env } from '../config/env.js';
 
-// Initialize Google Gen AI client with the explicit API key
 const ai = new GoogleGenAI({ apiKey: env.GEMINI_API_KEY });
 
 let circuitState = {
@@ -37,17 +36,70 @@ function recordFailure() {
 }
 
 /**
- * Maps standard message history and OpenAI-style tools to Gemini format
+ * Robust content mapping for Google Gen AI SDK.
+ * CRITICAL FIX: Exclude 'system' roles from contents to prevent consecutive user role collisions.
  */
-async function callGemini(model, messages, options = {}) {
-  const contents = messages.map(msg => ({
-    role: msg.role === 'assistant' ? 'model' : 'user',
-    parts: [{ text: typeof msg.content === 'string' ? msg.content : JSON.stringify(msg.content) }]
-  }));
+function buildGeminiContents(messages) {
+  const contents = [];
+  
+  for (const msg of messages) {
+    if (msg.role === 'system') {
+      continue; // Handled natively by config.systemInstruction
+    } else if (msg.role === 'assistant') {
+      const parts = [];
+      if (msg.content) parts.push({ text: msg.content });
+      if (msg.tool_calls) {
+        for (const tc of msg.tool_calls) {
+          let args = {};
+          try { args = JSON.parse(tc.function.arguments || '{}'); } catch(e){}
+          parts.push({
+            functionCall: {
+              name: tc.function.name,
+              args: args
+            }
+          });
+        }
+      }
+      contents.push({ role: 'model', parts });
+    } else if (msg.role === 'tool') {
+      let responseObj = {};
+      try { responseObj = JSON.parse(msg.content); } catch(e) { responseObj = { result: msg.content }; }
+      
+      contents.push({
+        role: 'function',
+        parts: [{
+          functionResponse: {
+            name: msg.name || 'unknown_tool',
+            response: responseObj
+          }
+        }]
+      });
+    } else {
+      contents.push({
+        role: 'user',
+        parts: [{ text: typeof msg.content === 'string' ? msg.content : JSON.stringify(msg.content) }]
+      });
+    }
+  }
+  return contents;
+}
 
+function extractSystemInstruction(messages) {
+  const systemMsg = messages.find(m => m.role === 'system');
+  if (!systemMsg) return undefined;
+  const text = typeof systemMsg.content === 'string' ? systemMsg.content : JSON.stringify(systemMsg.content);
+  return { parts: [{ text }] };
+}
+
+async function callGemini(model, messages, options = {}) {
+  const contents = buildGeminiContents(messages);
   const config = {};
 
-  // Map OpenAI tool declarations to Gemini functionDeclarations
+  const systemInstruction = extractSystemInstruction(messages);
+  if (systemInstruction) {
+    config.systemInstruction = systemInstruction;
+  }
+
   if (options.tools) {
     config.tools = [{
       functionDeclarations: options.tools.map(t => ({
@@ -64,8 +116,6 @@ async function callGemini(model, messages, options = {}) {
     config
   });
 
-  // WHY: Check response.functionCalls FIRST before accessing response.text.
-  // Accessing response.text first triggers the "non-text parts functionCall" warning in the SDK.
   if (response.functionCalls && response.functionCalls.length > 0) {
     return {
       role: 'assistant',
@@ -86,7 +136,6 @@ async function callGemini(model, messages, options = {}) {
 
 export async function generateAICompletion(messages, options = {}) {
   checkCircuitBreaker();
-
   const modelsToTry = [env.PRIMARY_MODEL, env.BACKUP_MODEL];
   let lastError = null;
 
@@ -99,9 +148,7 @@ export async function generateAICompletion(messages, options = {}) {
     } catch (err) {
       lastError = err;
       const isRetryable = err.status === 408 || err.status === 429 || (err.status >= 500 && err.status < 600) || !err.status;
-      if (!isRetryable || i === modelsToTry.length - 1) {
-        break;
-      }
+      if (!isRetryable || i === modelsToTry.length - 1) break;
     }
   }
 
@@ -109,71 +156,30 @@ export async function generateAICompletion(messages, options = {}) {
   throw lastError || new Error('All AI models failed');
 }
 
-export async function generateStructuredAIResponse(messages, validatorSchema) {
-  let rawOutput = await generateAICompletion(messages, { jsonMode: true });
-  
-  // Ensure output is string content if an object was returned
-  if (typeof rawOutput === 'object') {
-    rawOutput = JSON.stringify(rawOutput);
-  }
-
-  for (let attempt = 1; attempt <= 2; attempt++) {
-    try {
-      let cleaned = rawOutput.trim();
-      if (cleaned.startsWith('```json')) cleaned = cleaned.slice(7);
-      else if (cleaned.startsWith('```')) cleaned = cleaned.slice(3);
-      if (cleaned.endsWith('```')) cleaned = cleaned.slice(0, -3);
-      cleaned = cleaned.trim();
-
-      const parsedJson = JSON.parse(cleaned);
-      const validationResult = validatorSchema.safeParse(parsedJson);
-
-      if (!validationResult.success) {
-        throw new Error(`Schema validation failed: ${JSON.stringify(validationResult.error.format())}`);
-      }
-
-      return validationResult.data;
-    } catch (err) {
-      if (attempt === 2) {
-        throw new Error(`Malformed JSON response from AI after retry: ${err.message}`);
-      }
-      const correctionMessages = [
-        ...messages,
-        { role: 'assistant', content: rawOutput },
-        { role: 'user', content: 'Your previous response was not valid JSON matching the required schema. Please output strictly valid JSON without extra text or markdown wrapping.' }
-      ];
-      rawOutput = await generateAICompletion(correctionMessages);
-      if (typeof rawOutput === 'object') rawOutput = JSON.stringify(rawOutput);
-    }
-  }
-}
-
-/* ============================ STREAMING ============================ */
-
 export async function generateAICompletionStream(messages, { onDelta, isAborted } = {}) {
   checkCircuitBreaker();
-
   const modelsToTry = [env.PRIMARY_MODEL, env.BACKUP_MODEL];
   let lastError = null;
 
   for (let i = 0; i < modelsToTry.length; i++) {
     const model = modelsToTry[i];
     try {
-      const contents = messages.map(msg => ({
-        role: msg.role === 'assistant' ? 'model' : 'user',
-        parts: [{ text: typeof msg.content === 'string' ? msg.content : JSON.stringify(msg.content) }]
-      }));
+      const contents = buildGeminiContents(messages);
+      const config = {};
+      const systemInstruction = extractSystemInstruction(messages);
+      if (systemInstruction) {
+        config.systemInstruction = systemInstruction;
+      }
 
       const responseStream = await ai.models.generateContentStream({
         model,
-        contents
+        contents,
+        config
       });
 
       let fullText = '';
       for await (const chunk of responseStream) {
-        if (isAborted && isAborted()) {
-          return fullText;
-        }
+        if (isAborted && isAborted()) return fullText;
         const chunkText = chunk.text || '';
         if (chunkText) {
           fullText += chunkText;
@@ -186,12 +192,10 @@ export async function generateAICompletionStream(messages, { onDelta, isAborted 
     } catch (err) {
       lastError = err;
       const isRetryable = err.status === 408 || err.status === 429 || (err.status >= 500 && err.status < 600) || !err.status;
-      if (!isRetryable || i === modelsToTry.length - 1) {
-        break;
-      }
+      if (!isRetryable || i === modelsToTry.length - 1) break;
     }
   }
 
   recordFailure();
   throw lastError || new Error('All AI models failed');
-}
+} 
