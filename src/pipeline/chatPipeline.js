@@ -63,6 +63,13 @@ export async function runChatPipeline(vendor, messages, sink = null) {
   let intent = 'inquiry';
   let contextInjected = false;
 
+  // Helper to safely send live status updates to the frontend via sink
+  const updateStatus = (text) => {
+    if (sink && typeof sink.status === 'function') {
+      sink.status(text);
+    }
+  };
+
   // ---------------------------------------------------------------------------
   // 1. DETERMINISTIC PRE-ROUTER (Bypasses LLM Parametric Laziness completely)
   // ---------------------------------------------------------------------------
@@ -77,11 +84,15 @@ export async function runChatPipeline(vendor, messages, sink = null) {
 
     try {
       logger.info(`⚡ [Pre-Router] Intercepted policy inquiry. Discovering paths for: "${kw}"`);
+      updateStatus('Checking store directory & policies...');
+      
       const discoveredPages = await discoverStorePages(storeUrl, kw);
       
       if (discoveredPages && discoveredPages.length > 0) {
         const targetUrl = discoveredPages[0];
         logger.info(`⚡ [Pre-Router] Scraping live context from: ${targetUrl}`);
+        updateStatus('Reading official page content...');
+        
         const scraped = await scrapeProductDetails(targetUrl);
         
         if (scraped && scraped.content && !scraped.error) {
@@ -103,19 +114,23 @@ export async function runChatPipeline(vendor, messages, sink = null) {
   // ---------------------------------------------------------------------------
   const systemMessage = {
     role: "system",
-    content: `You are an expert sales assistant for ${vendor.name}. Classify every user message into one of three strict intents and handle it accordingly:
+    content: `You are an expert sales assistant. Classify every user message into one of four strict intents and handle it accordingly:
 
-1. **INQUIRY**: 
-   - User asks about company trust, policies, background ("Is this company trusted?", "What is your return policy?"), or general info.
-   - **Rule**: NEVER guess or answer policies from pre-trained knowledge. If official store context is injected in system messages, summarize it directly. Otherwise, call \`discover_store_pages\`, then \`scrape_product_details\`. \`products\` must be empty \`[]\`.
+1. **PURCHASE**: 
+   - User wants to buy, check stock ("Do you have..."), or specify a budget.
+   - **Rule**: Call "search_products"
 
-2. **PURCHASE**: 
-   - User wants to buy, asks if an item is in stock ("Do you have..."), or gives a budget ("under $100").
-   - **Rule**: Call \`search_products\`. Return 1 item if specific, or up to 8 if browsing.
+2. **INQUIRY**: 
+   - User asks about store trust, background, or policies (refunds, shipping, terms, contact).
+   - **Rule**: Discover and scrape relevant store pages. Keep products empty "[]".
 
 3. **COMPARISON**: 
-   - User wants to compare two or more specific items.
-   - **Rule**: Fetch compared items and contrast Option A vs Option B in text reply.
+   - User wants to contrast specific items.
+   - **Rule**: Fetch compared items and contrast Option A vs Option B.
+
+4. **OFF-TOPIC**: 
+   - Any query unrelated to this store's inventory, products, or customer support (e.g., weather, general trivia, coding, personal chat).
+   - **Rule**: Politely and briefly decline in 1 sentence. Immediately pivot back to helping them find products or store info. Do not call any tools. Keep responses token-efficient.
 
 - NEVER output raw JSON, code blocks, or markdown code formatting in your reply text.`
   };
@@ -124,13 +139,14 @@ export async function runChatPipeline(vendor, messages, sink = null) {
   let updatedHistory = [...conversationHistory];
 
   try {
+    updateStatus('Analyzing query...');
     let currentResponse = await generateAICompletion(conversationHistory, {
       tools: agentTools,
-      tool_choice: contextInjected ? "none" : "auto" // Skip tool overhead if context was pre-routed
+      tool_choice: contextInjected ? "none" : "auto"
     });
 
     let iterations = 0;
-    // Multi-turn tool execution loop (allows discovering paths -> then scraping)
+    // Multi-turn tool execution loop
     while (currentResponse?.tool_calls && currentResponse.tool_calls.length > 0 && iterations < 2) {
       iterations++;
       const assistantMessage = typeof currentResponse === 'string'
@@ -156,8 +172,8 @@ export async function runChatPipeline(vendor, messages, sink = null) {
         try {
           if (funcName === "search_products") {
             intent = 'purchase';
+            updateStatus('Searching product catalog...');
             
-            // Normalize generic browse/bestseller terms to fetch available active catalog items
             let cleanQuery = args.query || '';
             const genericBrowseRegex = /(bestseller|best seller|popular|sale|new|catalog|browse|recommend)/i;
             if (genericBrowseRegex.test(cleanQuery)) {
@@ -165,6 +181,8 @@ export async function runChatPipeline(vendor, messages, sink = null) {
             }
 
             const searchResults = await searchShopifyProducts(storeUrl, { ...args, query: cleanQuery, inStockOnly: true }, vendor.currency || 'USD');
+            
+            updateStatus('Filtering in-stock items...');
             let rawProducts = Array.isArray(searchResults) ? searchResults : [];
             
             if (args.limit === 1 && rawProducts.length > 0) {
@@ -185,6 +203,8 @@ export async function runChatPipeline(vendor, messages, sink = null) {
           } 
           else if (funcName === "discover_store_pages") {
             intent = 'inquiry';
+            updateStatus('Discovering store directory & policies...');
+            
             const discoveredPages = await discoverStorePages(storeUrl, args.keyword || '');
             toolResult = {
               status: discoveredPages.length > 0 ? 'FOUND' : 'EMPTY_RESULTS',
@@ -193,6 +213,8 @@ export async function runChatPipeline(vendor, messages, sink = null) {
           }
           else if (funcName === "scrape_product_details") {
             intent = 'inquiry';
+            updateStatus('Reading official page content...');
+            
             const scrapedData = await scrapeProductDetails(args.productUrl);
             toolResult = { status: 'FOUND', details: scrapedData };
           }
@@ -209,8 +231,8 @@ export async function runChatPipeline(vendor, messages, sink = null) {
         });
       }
 
-      // If tools were called, check if the model wants to call more tools or if we reached max iterations
       if (iterations < 2) {
+        updateStatus('Synthesizing results...');
         currentResponse = await generateAICompletion(updatedHistory, {
           tools: agentTools,
           tool_choice: "auto"
@@ -220,7 +242,6 @@ export async function runChatPipeline(vendor, messages, sink = null) {
       }
     }
 
-    // If the model produced a direct text response without tool calls initially, push it safely
     if (currentResponse?.content && (!currentResponse.tool_calls || currentResponse.tool_calls.length === 0)) {
       updatedHistory.push(currentResponse);
     }
@@ -235,9 +256,9 @@ export async function runChatPipeline(vendor, messages, sink = null) {
       });
     }
 
+    updateStatus('Preparing response...');
     let finalReplyText = '';
     try {
-      // If history ends with tool calls or user messages, generate stream directly
       if (sink && typeof generateAICompletionStream === 'function') {
         finalReplyText = await generateAICompletionStream(updatedHistory, {
           onDelta: (text) => sink.delta(text),
