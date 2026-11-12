@@ -20,7 +20,7 @@ router.post('/', gateMiddleware, validateBody(chatBodySchema), async (req, res) 
   const { messages, sessionId, strikes: clientStrikes } = req.validatedBody;
   const latestMessage = messages[messages.length - 1]?.content || '';
 
-  // ============ FAST-PATH GREETINGS (Instant 0.1s response, bypasses LLM delay) ============
+  // ============ FAST-PATH GREETINGS (Instant response, bypasses LLM delay) ============
   const greetingRegex = /^(hi|hello|hey|greetings|good morning|good afternoon|good evening)\b/i;
   if (greetingRegex.test(latestMessage.trim()) && messages.length <= 2) {
     const greetingReply = {
@@ -32,9 +32,19 @@ router.post('/', gateMiddleware, validateBody(chatBodySchema), async (req, res) 
 
     if (wantsStream) {
       const sink = createStreamSink(res);
-      sink.meta({ products: [], state: 'normal', strikes: clientStrikes || 0 });
-      sink.delta(greetingReply.reply);
-      sink.done({ state: 'normal', strikes: clientStrikes || 0 });
+      sink.attachAbort(req);
+      try {
+        sink.meta({ 
+          products: greetingReply.products, 
+          chips: greetingReply.chips, 
+          state: greetingReply.intent, 
+          strikes: clientStrikes || 0 
+        });
+        sink.delta(greetingReply.reply);
+        sink.done({ state: 'normal', strikes: clientStrikes || 0 });
+      } catch (err) {
+        sink.error("Failed to render greeting.");
+      }
       return sink.end();
     } else {
       return res.status(200).json(greetingReply);
@@ -50,21 +60,25 @@ router.post('/', gateMiddleware, validateBody(chatBodySchema), async (req, res) 
   sink.attachAbort(req);
 
   try {
-    const result = await runChatPipeline(req.vendor, messages, sink);
+    await runChatPipeline(req.vendor, messages, sink);
 
     if (typeof req.incrementAiUsage === 'function') {
       req.incrementAiUsage();
     }
 
-    if (!sink.ended) {
+    if (!sink.aborted) {
       sink.end();
     }
   } catch (err) {
     logger.error('Chat endpoint streaming error', { error: err.message, stack: err.stack });
-    if (!res.headersSent) {
+    
+    // CRITICAL FIX: Since headers are already sent by createStreamSink, 
+    // we must push an explicit NDJSON error frame instead of checking !res.headersSent!
+    try {
       sink.error("I'm having a little trouble connecting to our catalog right now. Please try again in a moment!");
-      sink.end();
-    }
+    } catch (e) {}
+    
+    sink.end();
   }
 });
 
