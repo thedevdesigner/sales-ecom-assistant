@@ -247,9 +247,11 @@ export async function searchShopifyProducts(storeUrl, criteria, currency = 'USD'
   const c = typeof criteria === 'string' ? { query: criteria } : criteria || {};
   const f = {
     query: String(c.query || '').trim(),
-    maxPrice: num(c.maxPrice), minPrice: num(c.minPrice),
+    maxPrice: num(c.maxPrice), 
+    minPrice: num(c.minPrice),
     color: c.color ? String(c.color).toLowerCase().trim() : null,
-    inStockOnly: Boolean(c.inStockOnly),
+    // 🌟 Enforce in-stock filtering by default unless explicitly set to false
+    inStockOnly: c.inStockOnly !== undefined ? Boolean(c.inStockOnly) : true,
   };
   const limit = Math.min(Number(c.limit) || 12, 24);
 
@@ -262,6 +264,7 @@ export async function searchShopifyProducts(storeUrl, criteria, currency = 'USD'
   const hit = queryCache.get(key);
   if (hit && Date.now() - hit.at < QUERY_CACHE_TTL) return hit.value;
 
+  // 🌟 Search across all dynamic options, tags, titles, and variant descriptions in memory (<5ms)
   const docs = searchIndex(store, f, limit, normaliseSynonyms(c.synonyms));
   
   if (docs.length === 0 && !f.query) {
@@ -283,7 +286,6 @@ export async function searchShopifyProducts(storeUrl, criteria, currency = 'USD'
   if (queryCache.size > QUERY_CACHE_MAX) queryCache.delete(queryCache.keys().next().value);
   return value;
 }
-
 /* ---------------- FAST PATH-BASED PAGE & POLICY DISCOVERY ---------------- */
 const PATH_MAPS = {
   refund: [

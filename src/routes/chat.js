@@ -10,40 +10,74 @@ const ai = new GoogleGenAI({ apiKey: env.GEMINI_API_KEY });
 const storeTools = [{
   functionDeclarations: [{
     name: "search_products",
-    description: "Search store catalog for specific product names or keywords.",
+    description: "Search the store catalog dynamically for any product name, variant property, material, size, or keyword.",
     parameters: {
       type: "object",
       properties: {
-        query: { type: "string", description: "Product keyword to search." },
-        limit: { type: "number", description: "Number of items to fetch (max 6)." }
+        query: { 
+          type: "string", 
+          description: "The full search query containing all keywords, variant traits, materials, sizes, or preferences mentioned by the user (e.g., 'carbon steel combat knife under 500')." 
+        },
+        maxPrice: { type: "number", description: "Maximum budget limit if specified." },
+        inStockOnly: { type: "boolean", description: "Always true by default to ensure in-stock items are prioritized." }
       },
       required: ["query"]
     }
   }]
 }];
 
+/**
+ * Dynamically resolves the base store origin from incoming request metadata.
+ */
+function resolveStoreUrl(req) {
+  const { storeUrl, pageUrl } = req.body || {};
+
+  if (storeUrl && /^https?:\/\//i.test(storeUrl)) {
+    return new URL(storeUrl).origin;
+  }
+  if (pageUrl && /^https?:\/\//i.test(pageUrl)) {
+    try {
+      return new URL(pageUrl).origin;
+    } catch {}
+  }
+  const headerOrigin = req.headers.origin || req.headers.referer;
+  if (headerOrigin && /^https?:\/\//i.test(headerOrigin)) {
+    try {
+      return new URL(headerOrigin).origin;
+    } catch {}
+  }
+  return null;
+}
+
 router.post('/', async (req, res) => {
+  const sendFrame = (event, data) => {
+    if (!res.writableEnded) {
+      res.write(JSON.stringify({ event, data }) + '\n');
+    }
+  };
+
   try {
-    const { messages } = req.body;
+    const { messages, vendorId } = req.body;
 
     if (!messages || !Array.isArray(messages)) {
       return res.status(400).json({ error: 'Missing or invalid messages array' });
     }
 
-    // Stream headers
+    const storeUrl = resolveStoreUrl(req);
+    if (!storeUrl) {
+      return res.status(400).json({ error: 'Unable to determine store URL from request.' });
+    }
+
+    const storeName = vendorId || new URL(storeUrl).hostname;
+
+    // Stream headers to kill the browser "pending" state instantly
     res.setHeader('Content-Type', 'application/octet-stream');
     res.setHeader('Transfer-Encoding', 'chunked');
     res.setHeader('Cache-Control', 'no-cache');
     res.setHeader('Connection', 'keep-alive');
 
-    const storeUrl = 'https://nordicknives.com';
-    const model = env.PRIMARY_MODEL || 'gemini-3.5-flash';
+    const model = env.PRIMARY_MODEL || 'gemini-2.5-flash';
 
-    const sendFrame = (event, data) => {
-      res.write(JSON.stringify({ event, data }) + '\n');
-    };
-
-    // Micro-action: Analyzing
     sendFrame('status', { text: 'Analyzing request...' });
 
     const contents = messages.map(m => ({
@@ -51,12 +85,14 @@ router.post('/', async (req, res) => {
       parts: [{ text: m.content }]
     }));
 
-    // 1. Initial Call
+    // 1. Initial Call to check for tool calls
     const initialResponse = await ai.models.generateContent({
       model,
       contents,
       config: {
-        systemInstruction: { parts: [{ text: "You are a helpful e-commerce shopping assistant for Nordic Knives. Be concise and friendly." }] },
+        systemInstruction: {
+          parts: [{ text: `You are a helpful e-commerce shopping assistant for ${storeName}. Be concise and friendly.` }]
+        },
         tools: storeTools
       }
     });
@@ -73,23 +109,24 @@ router.post('/', async (req, res) => {
       if (fc.name === 'search_products') {
         intent = 'purchase';
         const query = args.query || '';
+
         sendFrame('status', { text: `Searching catalog for "${query}"...` });
-        
+
         try {
-          const results = await searchShopifyProducts(storeUrl, { query, limit: 4 }, 'USD');
+          const results = await searchShopifyProducts(storeUrl, { query, limit: args.limit || 4 }, 'USD');
           productsFound = Array.isArray(results) ? results : [];
         } catch (err) {
-          logger.error('[Chat] Shopify search failed', { error: err.message });
+          logger.error('[Chat] Shopify search failed', { storeUrl, error: err.message });
         }
       }
 
-      // Append assistant call parts
+      // Append model function call block
       finalContents.push({
         role: 'model',
         parts: [{ functionCall: { name: fc.name, args: fc.args } }]
       });
 
-      // Append SDK-compliant function response part
+      // Append SDK-compliant function response under model role parts
       finalContents.push({
         role: 'model',
         parts: [{
@@ -101,17 +138,18 @@ router.post('/', async (req, res) => {
       });
     }
 
-    // Send Meta Frame (products & intent)
+    // Send Meta frame containing products and intent state
     sendFrame('meta', { products: productsFound, chips: [], state: intent });
-
     sendFrame('status', { text: 'Synthesizing response...' });
 
-    // 3. Stream final response tokens
+    // 3. Stream final tokens from Gemini
     const stream = await ai.models.generateContentStream({
       model,
       contents: finalContents,
       config: {
-        systemInstruction: { parts: [{ text: "You are a helpful e-commerce shopping assistant. Keep answers natural, highlighting the found products if any." }] }
+        systemInstruction: {
+          parts: [{ text: `You are a helpful e-commerce shopping assistant for ${storeName}. Keep answers natural, highlighting found products if any.` }]
+        }
       }
     });
 
@@ -130,7 +168,7 @@ router.post('/', async (req, res) => {
     try {
       sendFrame('error', { message: "I'm having a little trouble connecting right now. Please try again in a moment!" });
       res.end();
-    } catch (e) {
+    } catch {
       res.end();
     }
   }
