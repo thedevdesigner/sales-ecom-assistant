@@ -167,20 +167,26 @@ export function warmShopifyCatalog(storeUrl) { return getStore(storeUrl).then(()
 /* ---------------- filtering and searching ---------------- */
 const num = (v) => (v === null || v === undefined || v === '' || !Number.isFinite(Number(v)) ? null : Number(v));
 
-function matchVariant(p, f) {
-  if (!p) return null;
-  if (f.maxPrice === null && f.minPrice === null && !f.color && !f.inStockOnly) {
-    return p.variants.find((v) => v.available) || p.variants[0];
+/* ---------------- Explicit, Readable Variant Matcher ---------------- */
+function matchVariant(product, filters) {
+  if (!product || !product.variants) return null;
+
+  let bestVariant = null;
+
+  for (const variant of product.variants) {
+    // 1. Must be in stock (default true)
+    if (filters.inStockOnly && !variant.available) continue;
+
+    // 2. Must respect price ceiling if provided
+    if (filters.maxPrice !== null && variant.price > filters.maxPrice) continue;
+
+    // 3. Pick the cheapest available variant that matches
+    if (!bestVariant || variant.price < bestVariant.price) {
+      bestVariant = variant;
+    }
   }
-  let best = null;
-  for (const v of p.variants) {
-    if (f.inStockOnly && !v.available) continue;
-    if (f.maxPrice !== null && !(v.price <= f.maxPrice)) continue;
-    if (f.minPrice !== null && !(v.price >= f.minPrice)) continue;
-    if (f.color && !(v.opts.some((o) => o.includes(f.color)) || p.textLc.includes(f.color))) continue;
-    if (!best || (v.available && !best.available) || (v.available === best.available && v.price < best.price)) best = v;
-  }
-  return best;
+
+  return bestVariant;
 }
 
 function buildQuery(terms, synonyms, mode) {
@@ -198,24 +204,6 @@ function normaliseSynonyms(raw) {
     out[key] = [...new Set((list || []).map((w) => processTerm(w)).filter(Boolean))];
   }
   return out;
-}
-
-function searchIndex(store, f, limit, synonyms) {
-  const terms = queryTerms(f.query);
-  const pass = (r) => !!matchVariant(store.byId.get(r.id), f);
-  let ids;
-
-  if (terms.length) {
-    let hits = store.ms.search(buildQuery(terms, synonyms, 'AND'), { filter: pass });
-    if (hits.length < 3 && terms.length > 1) hits = store.ms.search(buildQuery(terms, synonyms, 'OR'), { filter: pass });
-    ids = hits.slice(0, limit).map((h) => h.id);
-  } else {
-    const matched = [];
-    for (const d of store.docs) { const v = matchVariant(d, f); if (v) matched.push({ d, v }); }
-    matched.sort((a, b) => Number(b.v.available) - Number(b.v.available));
-    ids = matched.slice(0, limit).map((m) => m.d.id);
-  }
-  return ids.map((id) => store.byId.get(id));
 }
 
 /* ---------------- fallback suggest API (Guarantees results when products.json is rate-limited) ---------------- */
@@ -243,48 +231,61 @@ async function suggestFallback(storeUrl, f, currency, limit) {
   }
 }
 
+/* ---------------- Index Search Using Descriptive Variables ---------------- */
+function searchIndex(store, searchFilters, limit, synonyms) {
+  const terms = queryTerms(searchFilters.query);
+  
+  const pass = (record) => !!matchVariant(store.byId.get(record.id), searchFilters);
+  let matchedIds;
+
+  if (terms.length) {
+    let hits = store.ms.search(buildQuery(terms, synonyms, 'AND'), { filter: pass });
+    if (hits.length < 3 && terms.length > 1) {
+      hits = store.ms.search(buildQuery(terms, synonyms, 'OR'), { filter: pass });
+    }
+    matchedIds = hits.map((hit) => hit.id);
+  } else {
+    matchedIds = [];
+    for (const document of store.docs) {
+      const variant = matchVariant(document, searchFilters);
+      if (variant) matchedIds.push(document.id);
+    }
+  }
+
+  return matchedIds.slice(0, limit).map((id) => store.byId.get(id));
+}
+
+/* ---------------- Main Search Adapter ---------------- */
 export async function searchShopifyProducts(storeUrl, criteria, currency = 'USD') {
-  const c = typeof criteria === 'string' ? { query: criteria } : criteria || {};
-  const f = {
-    query: String(c.query || '').trim(),
-    maxPrice: num(c.maxPrice), 
-    minPrice: num(c.minPrice),
-    color: c.color ? String(c.color).toLowerCase().trim() : null,
-    // 🌟 Enforce in-stock filtering by default unless explicitly set to false
-    inStockOnly: c.inStockOnly !== undefined ? Boolean(c.inStockOnly) : true,
+  const rawCriteria = typeof criteria === 'string' ? { query: criteria } : criteria || {};
+  
+  const searchFilters = {
+    query: String(rawCriteria.query || '').trim(),
+    maxPrice: rawCriteria.maxPrice !== undefined && rawCriteria.maxPrice !== null ? Number(rawCriteria.maxPrice) : null,
+    inStockOnly: rawCriteria.inStockOnly !== false // Always true unless explicitly told otherwise
   };
-  const limit = Math.min(Number(c.limit) || 12, 24);
+  const limit = Math.min(Number(rawCriteria.limit) || 6, 12);
 
   const store = await getStore(storeUrl);
-  if (!store) {
-    return suggestFallback(storeUrl, f, currency, limit);
-  }
+  if (!store) return suggestFallback(storeUrl, searchFilters, currency, limit);
 
-  const key = `${storeUrl}|${store.version}|${JSON.stringify(f)}|${limit}|${JSON.stringify(c.synonyms || {})}`;
-  const hit = queryCache.get(key);
-  if (hit && Date.now() - hit.at < QUERY_CACHE_TTL) return hit.value;
+  const productDocs = searchIndex(store, searchFilters, limit);
 
-  // 🌟 Search across all dynamic options, tags, titles, and variant descriptions in memory (<5ms)
-  const docs = searchIndex(store, f, limit, normaliseSynonyms(c.synonyms));
-  
-  if (docs.length === 0 && !f.query) {
-    return suggestFallback(storeUrl, f, currency, limit);
-  }
-
-  const value = docs.map((d) => {
-    const v = matchVariant(d, f);
+  return productDocs.map((productDoc) => {
+    const variant = matchVariant(productDoc, searchFilters);
     return {
       ...normalizeProduct({
-        id: d.id, title: d.title, price: v.price, currency, imageUrl: v.img,
-        url: `${storeUrl}/products/${d.handle}?variant=${v.id}`, inStock: v.available,
+        id: productDoc.id, 
+        title: productDoc.title, 
+        price: variant.price, 
+        currency, 
+        imageUrl: variant.img,
+        url: `${storeUrl}/products/${productDoc.handle}?variant=${variant.id}`, 
+        inStock: variant.available,
       }, currency),
-      description: d.desc,
+      description: productDoc.desc,
     };
   });
-
-  queryCache.set(key, { at: Date.now(), value });
-  if (queryCache.size > QUERY_CACHE_MAX) queryCache.delete(queryCache.keys().next().value);
-  return value;
 }
 /* ---------------- FAST PATH-BASED PAGE & POLICY DISCOVERY ---------------- */
 const PATH_MAPS = {

@@ -10,16 +10,27 @@ const ai = new GoogleGenAI({ apiKey: env.GEMINI_API_KEY });
 const storeTools = [{
   functionDeclarations: [{
     name: "search_products",
-    description: "Search the store catalog dynamically for any product name, variant property, material, size, or keyword.",
+    description: "Search the catalog dynamically. You MUST analyze the user's query for any specific attributes, variants, materials, sizes, colors, dimensions, or budgets, and populate them dynamically into the filters object.",
     parameters: {
       type: "object",
       properties: {
         query: { 
           type: "string", 
-          description: "The full search query containing all keywords, variant traits, materials, sizes, or preferences mentioned by the user (e.g., 'carbon steel combat knife under 500')." 
+          description: "The core product search keywords (e.g., 'knife', 'pouch')." 
         },
-        maxPrice: { type: "number", description: "Maximum budget limit if specified." },
-        inStockOnly: { type: "boolean", description: "Always true by default to ensure in-stock items are prioritized." }
+        filters: {
+          type: "object",
+          description: "Dynamic key-value pairs of any attributes, dimensions, colors, materials, or limits mentioned by the user (e.g., { maxPrice: 40, length: '5 inch', color: 'black' }).",
+          properties: {
+            maxPrice: { type: "number", description: "Upper budget limit if stated." },
+            minPrice: { type: "number", description: "Lower budget limit if stated." }
+          },
+          additionalProperties: { type: "string" } // 🌟 Allows any dynamic variant key like width, height, size, color, etc.
+        },
+        inStockOnly: {
+        type: "boolean", 
+        description: "Always true by default to filter out sold-out items." 
+        }
       },
       required: ["query"]
     }
