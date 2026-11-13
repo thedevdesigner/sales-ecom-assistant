@@ -118,10 +118,20 @@ router.post('/', async (req, res) => {
       if (fc.name === 'search_products') {
         intent = 'purchase';
         const a = fc.args || {};
+        console.log("[SEARCH TEST] Gemini arguments:", {
+  query: a.query,
+  maxPrice: a.maxPrice,
+  filters: a.filters,
+  inStockOnly: a.inStockOnly
+});
         sendFrame('status', { text: `Searching catalog for "${a.query || ''}"...` });
         try {
           // The tool arguments already use the adapter's criteria names, so they go straight through (maxPrice, minPrice, color, attributes, inStockOnly)
           const results = await searchShopifyProducts(storeUrl, { ...a, limit: 4 }, 'USD');
+          console.log("[SEARCH TEST] Products returned:", {
+  count: results?.length,
+  titles: results?.map(p => p.title)
+});
           for (const r of results) if (!productsFound.some((p) => p.id === r.id)) productsFound.push(r);
           payload = { count: results.length, products: results.map(({ title, price, currency, inStock, description, attributeMatches, attributesRequested }) => ({ title, price, currency, inStock, description, attributeMatches, attributesRequested })) };
         } catch (err) {

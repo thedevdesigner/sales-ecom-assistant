@@ -130,6 +130,11 @@ function toDoc(p) {
 
 async function buildStore(storeUrl) {
   const raw = await fetchCatalog(storeUrl);
+  console.log("[CATALOG TEST]", {
+  totalRawProducts: raw.length,
+  firstProduct: raw[0]?.title,
+  lastProduct: raw[raw.length - 1]?.title
+});
   const docs = raw.map(toDoc).filter(Boolean);
   if (!docs.length) throw new Error('empty catalog');
   const ms = new MiniSearch({
@@ -144,6 +149,10 @@ async function buildStore(storeUrl) {
     },
   });
   await ms.addAllAsync(docs, { chunkSize: 500 });
+  console.log("[INDEX TEST]", {
+  indexedDocuments: docs.length,
+  indexedSuccessfully: true
+});
   const byId = new Map(docs.map((d) => [d.id, d]));
   return { ms, byId, docs, version: Date.now() };
 }
@@ -240,6 +249,10 @@ function searchIndex(store, searchFilters, limit, synonyms) {
 
   if (terms.length) {
     let hits = store.ms.search(buildQuery(terms, synonyms, 'AND'), { filter: pass });
+    console.log("[SEARCH INDEX TEST]", {
+  queryTerms: terms,
+  andMatches: hits.length
+});
     if (hits.length < 3 && terms.length > 1) {
       hits = store.ms.search(buildQuery(terms, synonyms, 'OR'), { filter: pass });
     }
