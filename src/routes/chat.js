@@ -1,79 +1,133 @@
 import { Router } from 'express';
-import { gateMiddleware } from '../middleware/gate.js';
-import { validateBody, chatBodySchema } from '../middleware/validator.js';
-import { runChatPipeline } from '../pipeline/chatPipeline.js';
-import { createStreamSink } from '../utils/streamSink.js';
+import { GoogleGenAI } from '@google/genai';
+import { env } from '../config/env.js';
+import { searchShopifyProducts } from '../adapters/shopifyAdapter.js';
 import { logger } from '../utils/logger.js';
 
 const router = Router();
+const ai = new GoogleGenAI({ apiKey: env.GEMINI_API_KEY });
 
-/**
- * POST /chat
- * Supports NDJSON streaming (Accept: application/octet-stream or { stream: true })
- * and legacy JSON responses. All messages, including greetings, flow to the LLM.
- */
-router.post('/', gateMiddleware, validateBody(chatBodySchema), async (req, res) => {
-  const wantsStream =
-    (req.headers.accept || '').includes('application/octet-stream') ||
-    req.validatedBody.stream === true;
+// Define the store search tool directly
+const storeTools = [{
+  functionDeclarations: [{
+    name: "search_products",
+    description: "Search store catalog for specific product names or keywords.",
+    parameters: {
+      type: "object",
+      properties: {
+        query: { type: "string", description: "Product keyword to search." },
+        limit: { type: "number", description: "Number of items to fetch (max 6)." }
+      },
+      required: ["query"]
+    }
+  }]
+}];
 
-  const { messages } = req.validatedBody;
-
-  if (!wantsStream) {
-    return handleLegacy(req, res, messages);
-  }
-
-  const sink = createStreamSink(res);
-  sink.attachAbort(req);
-
+router.post('/', async (req, res) => {
   try {
-    await runChatPipeline(req.vendor, messages, sink);
+    const { messages, vendorId } = req.body;
 
-    if (typeof req.incrementAiUsage === 'function') {
-      req.incrementAiUsage();
+    if (!messages || !Array.isArray(messages)) {
+      return res.status(400).json({ error: 'Missing or invalid messages array' });
     }
 
-    if (!sink.aborted) {
-      sink.end();
+    // Set headers for NDJSON / Chunked stream immediately so browser stops "pending"
+    res.setHeader('Content-Type', 'application/octet-stream');
+    res.setHeader('Transfer-Encoding', 'chunked');
+    res.setHeader('Cache-Control', 'no-cache');
+    res.setHeader('Connection', 'keep-alive');
+
+    const storeUrl = 'https://nordicknives.com'; // Fallback or pull dynamically
+    const model = env.PRIMARY_MODEL || 'gemini-1.5-flash';
+
+    // Format incoming messages for Gemini SDK
+    const contents = messages.map(m => ({
+      role: m.role === 'assistant' ? 'model' : 'user',
+      parts: [{ text: m.content }]
+    }));
+
+    // 1. Initial Call to check if Gemini wants to call a tool (like search_products)
+    const initialResponse = await ai.models.generateContent({
+      model,
+      contents,
+      config: {
+        systemInstruction: { parts: [{ text: "You are a helpful e-commerce shopping assistant. Be concise and friendly." }] },
+        tools: storeTools
+      }
+    });
+
+    let finalContents = [...contents];
+    let productsFound = [];
+
+    // 2. Handle Tool Execution if Gemini triggers search_products
+    if (initialResponse.functionCalls && initialResponse.functionCalls.length > 0) {
+      const fc = initialResponse.functionCalls[0];
+      const args = fc.args || {};
+
+      if (fc.name === 'search_products') {
+        const query = args.query || '';
+        logger.info(`[Simple Chat] Tool execution: searching products for '${query}'`);
+        
+        try {
+          const results = await searchShopifyProducts(storeUrl, { query, limit: 4 }, 'USD');
+          productsFound = Array.isArray(results) ? results : [];
+        } catch (err) {
+          logger.error('[Simple Chat] Shopify search failed', { error: err.message });
+        }
+      }
+
+      // Append assistant call and function response back into conversation history
+      finalContents.push({
+        role: 'model',
+        parts: [{ functionCall: { name: fc.name, args: fc.args } }]
+      });
+
+      finalContents.push({
+        role: 'function',
+        parts: [{
+          functionResponse: {
+            name: fc.name,
+            response: { products: productsFound }
+          }
+        }]
+      });
+    } else if (initialResponse.text) {
+      // If no tool was called, we can push the initial text or let the stream generate it
     }
+
+    // 3. Send Meta Frame first so frontend knows about products/chips instantly
+    res.write(JSON.stringify({ event: 'meta', data: { products: productsFound, chips: [] } }) + '\n');
+
+    // 4. Stream final response tokens directly from Gemini
+    const stream = await ai.models.generateContentStream({
+      model,
+      contents: finalContents,
+      config: {
+        systemInstruction: { parts: [{ text: "You are a helpful e-commerce shopping assistant. Keep answers natural and helpful." }] }
+      }
+    });
+
+    for await (const chunk of stream) {
+      const chunkText = chunk.text || '';
+      if (chunkText) {
+        // Send delta frame for every token chunk
+        res.write(JSON.stringify({ event: 'delta', data: { text: chunkText } }) + '\n');
+      }
+    }
+
+    // 5. Send Done Frame and close the loop cleanly
+    res.write(JSON.stringify({ event: 'done', data: { status: 'ok' } }) + '\n');
+    res.end();
+
   } catch (err) {
-    logger.error('Chat endpoint streaming error', { error: err.message, stack: err.stack });
-
+    logger.error('[Simple Chat Error]', { error: err.message, stack: err.stack });
     try {
-      sink.error("I'm having a little trouble connecting to our catalog right now. Please try again in a moment!");
-    } catch (e) {}
-
-    sink.end();
+      res.write(JSON.stringify({ event: 'error', data: { message: err.message } }) + '\n');
+      res.end();
+    } catch (e) {
+      res.end();
+    }
   }
 });
-
-/**
- * Legacy behavior for non-streaming clients.
- */
-async function handleLegacy(req, res, messages) {
-  try {
-    const result = await runChatPipeline(req.vendor, messages, null);
-
-    if (typeof req.incrementAiUsage === 'function') {
-      req.incrementAiUsage();
-    }
-
-    return res.status(200).json({
-      reply: result.reply,
-      products: result.products || [],
-      state: result.state || 'normal',
-      strikes: result.strikes || 0,
-      ...(result.chips ? { chips: result.chips } : {})
-    });
-  } catch (err) {
-    logger.error('Chat endpoint execution error', { error: err.message, stack: err.stack });
-    return res.status(500).json({
-      reply: "I'm having a little trouble connecting to our catalog right now. Please try again in a moment!",
-      products: [],
-      state: 'normal',
-      strikes: 0
-    });
-  }
-}
 
 export default router;
