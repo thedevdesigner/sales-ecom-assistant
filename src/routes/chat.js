@@ -10,27 +10,16 @@ const ai = new GoogleGenAI({ apiKey: env.GEMINI_API_KEY });
 const storeTools = [{
   functionDeclarations: [{
     name: "search_products",
-    description: "Search the catalog dynamically. You MUST analyze the user's query for any specific attributes, variants, materials, sizes, colors, dimensions, or budgets, and populate them dynamically into the filters object.",
+    description: "Search the store catalog. Use it whenever the shopper wants to find, buy or check stock of products. Put the core product words in query and every stated constraint in its own field.",
     parameters: {
       type: "object",
       properties: {
-        query: { 
-          type: "string", 
-          description: "The core product search keywords (e.g., 'knife', 'pouch')." 
-        },
-        filters: {
-          type: "object",
-          description: "Dynamic key-value pairs of any attributes, dimensions, colors, materials, or limits mentioned by the user (e.g., { maxPrice: 40, length: '5 inch', color: 'black' }).",
-          properties: {
-            maxPrice: { type: "number", description: "Upper budget limit if stated." },
-            minPrice: { type: "number", description: "Lower budget limit if stated." }
-          },
-          additionalProperties: { type: "string" } // 🌟 Allows any dynamic variant key like width, height, size, color, etc.
-        },
-        inStockOnly: {
-        type: "boolean", 
-        description: "Always true by default to filter out sold-out items." 
-        }
+        query: { type: "string", description: "Core product keywords only, e.g. 'combat knife'. No prices, colors or filler words." },
+        maxPrice: { type: "number", description: "Upper budget limit, if stated." },
+        minPrice: { type: "number", description: "Lower budget limit, if stated." },
+        color: { type: "string", description: "A color, if stated." },
+        attributes: { type: "array", items: { type: "string" }, description: "Any other stated requirement, one per item, e.g. '5 inch', 'carbon steel'." },
+        inStockOnly: { type: "boolean", description: "true unless the shopper asks to see sold-out items." }
       },
       required: ["query"]
     }
@@ -112,45 +101,49 @@ router.post('/', async (req, res) => {
     let productsFound = [];
     let intent = 'inquiry';
 
-    // 2. Handle Tool Execution
-    if (initialResponse.functionCalls && initialResponse.functionCalls.length > 0) {
-      const fc = initialResponse.functionCalls[0];
-      const args = fc.args || {};
+    // 2. Run EVERY tool call the model made (it can make several at once)
+    const calls = initialResponse.functionCalls || [];
+
+    if (calls.length === 0) {
+      // No tool needed: the first response already is the answer. Stream it instead of generating it a second time.
+      sendFrame('meta', { products: [], chips: [], state: intent });
+      sendFrame('delta', { text: initialResponse.text || '' });
+      sendFrame('done', { status: 'ok', strikes: 0 });
+      return res.end();
+    }
+
+    const responseParts = await Promise.all(calls.map(async (fc) => {
+      let payload = { error: `Unknown tool: ${fc.name}` };
 
       if (fc.name === 'search_products') {
         intent = 'purchase';
-        const query = args.query || '';
-
-        sendFrame('status', { text: `Searching catalog for "${query}"...` });
-
+        const a = fc.args || {};
+        sendFrame('status', { text: `Searching catalog for "${a.query || ''}"...` });
         try {
-          const results = await searchShopifyProducts(storeUrl, { query, limit: args.limit || 4 }, 'USD');
-          productsFound = Array.isArray(results) ? results : [];
+          // The tool arguments already use the adapter's criteria names, so they go straight through (maxPrice, minPrice, color, attributes, inStockOnly)
+          const results = await searchShopifyProducts(storeUrl, { ...a, limit: 4 }, 'USD');
+          for (const r of results) if (!productsFound.some((p) => p.id === r.id)) productsFound.push(r);
+          payload = { count: results.length, products: results.map(({ title, price, currency, inStock, description, attributeMatches, attributesRequested }) => ({ title, price, currency, inStock, description, attributeMatches, attributesRequested })) };
         } catch (err) {
-          logger.error('[Chat] Shopify search failed', { storeUrl, error: err.message });
+          logger.error('[Chat] Shopify search failed', { storeUrl, error: err.message, stack: err.stack });
+          payload = { count: 0, products: [], error: 'search_failed' };
         }
       }
 
-      // Append model function call block
-      finalContents.push({
-        role: 'model',
-        parts: [{ functionCall: { name: fc.name, args: fc.args } }]
-      });
+      // One functionResponse per functionCall, same order; id is echoed when the API supplied one
+      return { functionResponse: { name: fc.name, ...(fc.id ? { id: fc.id } : {}), response: payload } };
+    }));
 
-      // Append SDK-compliant function response under model role parts
-      finalContents.push({
-        role: 'model',
-        parts: [{
-          functionResponse: {
-            name: fc.name,
-            response: { products: productsFound }
-          }
-        }]
-      });
+    // The model's own turn goes back UNTOUCHED (keeps ids and thoughtSignature); the tool results are a USER turn.
+    const candidate = initialResponse.candidates?.[0];
+    if (!candidate?.content) {
+    throw new Error('Gemini returned no usable candidate content');
     }
+    finalContents.push(candidate.content);
+    finalContents.push({ role: 'user', parts: responseParts });
 
     // Send Meta frame containing products and intent state
-    sendFrame('meta', { products: productsFound, chips: [], state: intent });
+    sendFrame('meta', { products: productsFound.slice(0, 6), chips: [], state: intent });
     sendFrame('status', { text: 'Synthesizing response...' });
 
     // 3. Stream final tokens from Gemini
@@ -159,8 +152,10 @@ router.post('/', async (req, res) => {
       contents: finalContents,
       config: {
         systemInstruction: {
-          parts: [{ text: `You are a helpful e-commerce shopping assistant for ${storeName}. Keep answers natural, highlighting found products if any.` }]
-        }
+          parts: [{ text: `You are a helpful e-commerce shopping assistant for ${storeName}. Keep answers natural, highlighting found products if any. If attributeMatches is lower than attributesRequested, say the item is a close match rather than an exact one.` }]
+        },
+        tools: storeTools,
+        toolConfig: { functionCallingConfig: { mode: 'NONE' } }
       }
     });
 

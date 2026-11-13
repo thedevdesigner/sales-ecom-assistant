@@ -259,11 +259,13 @@ function searchIndex(store, searchFilters, limit, synonyms) {
 export async function searchShopifyProducts(storeUrl, criteria, currency = 'USD') {
   const rawCriteria = typeof criteria === 'string' ? { query: criteria } : criteria || {};
   
-  const searchFilters = {
-    query: String(rawCriteria.query || '').trim(),
-    maxPrice: rawCriteria.maxPrice !== undefined && rawCriteria.maxPrice !== null ? Number(rawCriteria.maxPrice) : null,
-    inStockOnly: rawCriteria.inStockOnly !== false // Always true unless explicitly told otherwise
-  };
+const searchFilters = {
+  query: String(rawCriteria.query || '').trim(),
+  maxPrice: rawCriteria.maxPrice !== undefined && rawCriteria.maxPrice !== null
+    ? Number(rawCriteria.maxPrice)
+    : null,
+  inStockOnly: rawCriteria.inStockOnly !== false
+};
   const limit = Math.min(Number(rawCriteria.limit) || 6, 12);
 
   const store = await getStore(storeUrl);
