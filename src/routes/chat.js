@@ -61,7 +61,7 @@ router.post('/', async (req, res) => {
       parts: [{ text: m.content }]
     }));
 
-    /**
+/**
      * ========================================================================
      * MASTER CONTROL - PHASE 2: SYNTHESIS & PRODUCT DIRECTIVE
      * ========================================================================
@@ -72,21 +72,24 @@ router.post('/', async (req, res) => {
     if (localProducts !== undefined) {
       sendFrame('status', { text: 'Synthesizing response...' });
 
-      const contextPrompt = localProducts.length > 0
-        ? `Here are the exact verified products found in the catalog matching the user's request: ${JSON.stringify(localProducts)}. You MUST reference these exact items.`
-        : `No matching products were found in the catalog for this request. Politely let the user know and offer alternatives.`;
-
-      contents.push({
-        role: 'user',
-        parts: [{ text: contextPrompt }]
-      });
+      // FIX: Append catalog context directly to the final user message to preserve alternating roles
+      const lastContent = contents[contents.length - 1];
+      if (lastContent && lastContent.role === 'user') {
+        const contextPrompt = localProducts.length > 0
+          ? `\n\n[Catalog Data Found: ${JSON.stringify(localProducts)}]`
+          : `\n\n[Catalog Data Found: None]`;
+        
+        if (lastContent.parts && lastContent.parts[0]) {
+          lastContent.parts[0].text += contextPrompt;
+        }
+      }
 
       const stream = await ai.models.generateContentStream({
         model,
         contents,
         config: {
           systemInstruction: {
-            parts: [{ text: `You are an AI shopping assistant for ${storeName}. Speak naturally and base your response strictly on the verified catalog results provided.` }]
+            parts: [{ text: `You are an AI shopping assistant for ${storeName}. Speak naturally and base your response strictly on the verified catalog results provided in the prompt context.` }]
           }
         }
       });
@@ -102,7 +105,6 @@ router.post('/', async (req, res) => {
       sendFrame('done', { status: 'ok', strikes: 0 });
       return res.end();
     }
-
     /**
      * ========================================================================
      * MASTER CONTROL - PHASE 1: INTENT & SEARCH DIRECTIVE DISPATCH
