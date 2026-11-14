@@ -4,11 +4,12 @@
     "name": "nordic knives",
     "platform": "shopify",
     "storeUrl": "https://nordic-knives.myshopify.com",
-    "allowedOrigins": ["https://nordic-knives.myshopify.com","https://nordicknives.com/","https://www.nordicknives.com","http://localhost:3000"],
+    "allowedOrigins": ["https://nordic-knives.myshopify.com","https://nordicknives.com/","https://www.nordicknives.com"],
     "currency": "USD",
     "widgetConfig": {
       "title": "AI Shopping Assistant",
       "primaryColor": "#000000",
       "welcomeMessage": "Hi! Looking for something specific today?"
-    },  }
+    }
+    }
 ]
