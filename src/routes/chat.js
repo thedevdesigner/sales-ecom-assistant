@@ -105,7 +105,7 @@ router.post('/',verifyDomainMiddleware, async (req, res) => {
 - Use 'search_products' when the user wants to find products (intentType: 'purchase') OR asks for specifications/details of a product (intentType: 'product_info').
 - Use 'get_store_info' when the user asks about return/refund policies, shipping, terms, privacy, contact email/phone, or company background.
 CRITICAL FORMATTING RULE: 
-- Never include URLs or Markdown links in your text response. Describe the item naturally; the UI will automatically display the interactive product card with the correct link.`
+- Never include URLs or Markdown links in your text response.`
           }]
         },
         tools: storeTools
