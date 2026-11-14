@@ -2,7 +2,7 @@ import express from 'express';
 import helmet from 'helmet';
 import { env } from './src/config/env.js';
 import chatRouter from './src/routes/chat.js';
-import vendorRouter from './src/routes/chat.js';
+import vendorRouter from './src/routes/config.js';
 
 import cors from 'cors'
 
