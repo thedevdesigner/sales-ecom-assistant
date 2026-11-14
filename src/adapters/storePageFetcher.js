@@ -47,7 +47,7 @@ export async function fetchStorePageContent(storeOrigin, topic) {
 
       const response = await fetch(jinaEndpoint, {
         headers,
-        signal: AbortSignal.timeout(8000)
+        signal: AbortSignal.timeout(12000)
       });
 
       if (!response.ok) continue;
