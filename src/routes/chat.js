@@ -24,6 +24,15 @@ const storeTools = [{
   }]
 }];
 
+/**
+ * ============================================================================
+ * MASTER CONTROL PLAN: BACKEND ROUTE HANDLER
+ * ============================================================================
+ * Acts as the absolute master controller. Coordinates the two-phase handshake:
+ * Phase 1: Analyzes user intent and issues a search directive to the frontend.
+ * Phase 2: Receives local database results from the frontend, validates truth,
+ *          and streams both the fact-checked text and an explicit product rendering directive.
+ */
 router.post('/', async (req, res) => {
   const sendFrame = (event, data) => {
     if (!res.writableEnded) {
@@ -32,7 +41,7 @@ router.post('/', async (req, res) => {
   };
 
   try {
-    const { messages, vendorId } = req.body;
+    const { messages, vendorId, localProducts } = req.body;
 
     if (!messages || !Array.isArray(messages)) {
       return res.status(400).json({ error: 'Missing or invalid messages array' });
@@ -47,84 +56,93 @@ router.post('/', async (req, res) => {
     res.setHeader('Connection', 'keep-alive');
 
     const model = env.PRIMARY_MODEL || 'gemini-2.5-flash';
-
-    sendFrame('status', { text: 'Analyzing request...' });
-
     const contents = messages.map(m => ({
       role: m.role === 'assistant' ? 'model' : 'user',
       parts: [{ text: m.content }]
     }));
 
-    // 1. Initial LLM Call to evaluate user intent
+    /**
+     * ========================================================================
+     * MASTER CONTROL - PHASE 2: SYNTHESIS & PRODUCT DIRECTIVE
+     * ========================================================================
+     * Triggered when the subordinate frontend sends back the local IndexedDB results.
+     * The backend master injects this truth into Gemini to prevent hallucinations,
+     * streams the conversational response, and issues an explicit product rendering directive.
+     */
+    if (localProducts !== undefined) {
+      sendFrame('status', { text: 'Synthesizing response...' });
+
+      const contextPrompt = localProducts.length > 0
+        ? `Here are the exact verified products found in the catalog matching the user's request: ${JSON.stringify(localProducts)}. You MUST reference these exact items.`
+        : `No matching products were found in the catalog for this request. Politely let the user know and offer alternatives.`;
+
+      contents.push({
+        role: 'user',
+        parts: [{ text: contextPrompt }]
+      });
+
+      const stream = await ai.models.generateContentStream({
+        model,
+        contents,
+        config: {
+          systemInstruction: {
+            parts: [{ text: `You are an AI shopping assistant for ${storeName}. Speak naturally and base your response strictly on the verified catalog results provided.` }]
+          }
+        }
+      });
+
+      for await (const chunk of stream) {
+        if (chunk.text) {
+          sendFrame('delta', { text: chunk.text });
+        }
+      }
+
+      // MASTER DIRECTIVE: Explicitly command the frontend on what products to render
+      sendFrame('products', { items: localProducts, intent: localProducts.length > 0 ? 'purchase' : 'inquiry' });
+      sendFrame('done', { status: 'ok', strikes: 0 });
+      return res.end();
+    }
+
+    /**
+     * ========================================================================
+     * MASTER CONTROL - PHASE 1: INTENT & SEARCH DIRECTIVE DISPATCH
+     * ========================================================================
+     * Evaluates initial user message. If product search is requested, extracts filters
+     * and commands the frontend subordinate to query its local database.
+     */
+    sendFrame('status', { text: 'Analyzing request...' });
+
     const initialResponse = await ai.models.generateContent({
       model,
       contents,
       config: {
         systemInstruction: {
-          parts: [{ text: `You are an AI shopping assistant for ${storeName}. Be concise, friendly, and helpful. If the user is looking for products, use the search_products tool to extract their search criteria.` }]
+          parts: [{ text: `You are an AI shopping assistant for ${storeName}. Use the search_products tool if the user wants to find products.` }]
         },
         tools: storeTools
       }
     });
 
-    let finalContents = [...contents];
-    let intent = 'inquiry';
     const calls = initialResponse.functionCalls || [];
 
-    // 2. If no product search tool is called, stream standard conversational response
+    // If no product search is required, stream standard text response directly
     if (calls.length === 0) {
       sendFrame('intent', { filters: null, state: 'inquiry' });
       sendFrame('delta', { text: initialResponse.text || '' });
+      sendFrame('products', { items: [], intent: 'inquiry' });
       sendFrame('done', { status: 'ok', strikes: 0 });
       return res.end();
     }
 
-    // 3. Process tool calls: Emit structured filters down to the client for local IndexedDB execution
     let extractedFilters = {};
     for (const fc of calls) {
       if (fc.name === 'search_products') {
-        intent = 'purchase';
         extractedFilters = fc.args || {};
-        sendFrame('status', { text: `Searching catalog for "${extractedFilters.query || ''}"...` });
       }
     }
 
-    // Send the intent frame to the frontend so it can query IndexedDB locally (Zero 429s!)
-    sendFrame('intent', { filters: extractedFilters, state: intent });
-
-    // Construct the model conversation turn for token streaming
-    const candidate = initialResponse.candidates?.[0];
-    if (candidate?.content) {
-      finalContents.push(candidate.content);
-      // Fulfill the tool call requirement with a mock success response so Gemini can continue its conversational turn
-      const responseParts = calls.map(fc => ({
-        functionResponse: { name: fc.name, ...(fc.id ? { id: fc.id } : {}), response: { status: 'success', handledLocally: true } }
-      }));
-      finalContents.push({ role: 'user', parts: responseParts });
-    }
-
-    sendFrame('status', { text: 'Synthesizing response...' });
-
-    // 4. Stream final conversational tokens from Gemini
-    const stream = await ai.models.generateContentStream({
-      model,
-      contents: finalContents,
-      config: {
-        systemInstruction: {
-          parts: [{ text: `You are an AI shopping assistant for ${storeName}. Acknowledge the user's request naturally and present the products being shown to them.` }]
-        },
-        tools: storeTools,
-        toolConfig: { functionCallingConfig: { mode: 'NONE' } }
-      }
-    });
-
-    for await (const chunk of stream) {
-      const chunkText = chunk.text || '';
-      if (chunkText) {
-        sendFrame('delta', { text: chunkText });
-      }
-    }
-
+    // MASTER DIRECTIVE: Issue search filters down to the subordinate frontend
+    sendFrame('intent', { filters: extractedFilters, state: 'purchase' });
     sendFrame('done', { status: 'ok', strikes: 0 });
     res.end();
 
