@@ -23,8 +23,12 @@ export function verifyDomainMiddleware(req, res, next) {
   const incoming = (req.headers.origin || req.headers.referer || '').toLowerCase().replace(/\/+$/, '');
   
   if (Object.keys(allowedMap).length > 0 && !allowedMap[incoming]) {
-    return res.status(403).json({ error: 'Unauthorized' });
-  }
+const matchedVendor = allowedMap[incoming];
+    if (!matchedVendor) {
+      return res.status(403).json({ error: 'Unauthorized' });
+    }
+    // Attach the verified vendor object to the request!
+    req.vendor = matchedVendor;  }
   
   next();
 }

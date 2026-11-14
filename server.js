@@ -2,6 +2,8 @@ import express from 'express';
 import helmet from 'helmet';
 import { env } from './src/config/env.js';
 import chatRouter from './src/routes/chat.js';
+import vendorRouter from './src/routes/chat.js';
+
 import cors from 'cors'
 
 const app = express();
@@ -30,6 +32,7 @@ app.get('/health', (req, res) => {
   res.status(200).json({ ok: true, time: new Date().toISOString() });
 });
 app.use('/chat', chatRouter);
+app.use('/config', vendorRouter);
 app.use((req, res) => res.status(404).json({ error: 'not_found' }));
 app.use((err, req, res, next) => {
   console.error('request error:', err);
