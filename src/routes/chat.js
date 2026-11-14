@@ -5,6 +5,7 @@ import { logger } from '../utils/logger.js';
 import { storeTools } from '../utils/llmTools.js';
 import { resolveStoreOrigin } from '../utils/resolveOrigin.js';
 import {fetchStorePageContent} from '../adapters/storePageFetcher.js'
+import { verifyDomainMiddleware } from '../middleware/authorizeVendor.js';
 
 const router = Router();
 const ai = new GoogleGenAI({ apiKey: env.GEMINI_API_KEY });
@@ -14,7 +15,7 @@ const ai = new GoogleGenAI({ apiKey: env.GEMINI_API_KEY });
  * MASTER CONTROL PLAN: BACKEND ROUTE HANDLER
  * ============================================================================
  */
-router.post('/', async (req, res) => {
+router.post('/',verifyDomainMiddleware, async (req, res) => {
   const sendFrame = (event, data) => {
     if (!res.writableEnded) {
       res.write(JSON.stringify({ event, data }) + '\n');

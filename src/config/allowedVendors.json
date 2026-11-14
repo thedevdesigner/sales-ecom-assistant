@@ -1,0 +1,9 @@
+[
+  {
+    "id": "nordic-knives",
+    "name": "nordic knives",
+    "platform": "shopify",
+    "storeUrl": "https://nordic-knives.myshopify.com",
+    "allowedOrigins": ["https://nordic-knives.myshopify.com","https://nordicknives.com/","https://www.nordicknives.com"]
+  }
+]
