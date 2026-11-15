@@ -1,35 +1,40 @@
 import fs from 'fs';
 import path from 'path';
 
-// Use process.cwd() so it always finds your root config folder accurately
-const configPath = path.join(process.cwd(),'src', 'config', 'allowedVendors.json');
+const configPath = path.join(process.cwd(), 'src', 'config', 'allowedVendors.json');
 
-let allowedMap = {};
+// Normalize anything (origin or full URL) down to "https://host"
+function toOrigin(value) {
+  if (!value) return '';
+  try {
+    return new URL(value).origin.toLowerCase();
+  } catch {
+    return '';
+  }
+}
+
+const allowedMap = {};
 try {
   const data = JSON.parse(fs.readFileSync(configPath, 'utf8'));
   for (const vendor of data) {
-    if (vendor.allowedOrigins) {
-      for (const url of vendor.allowedOrigins) {
-        const cleanUrl = url.toLowerCase().replace(/\/+$/, '');
-        allowedMap[cleanUrl] = vendor;
-      }
+    const origins = [...(vendor.allowedOrigins || []), vendor.storeUrl];
+    for (const url of origins) {
+      const origin = toOrigin(url);
+      if (origin) allowedMap[origin] = vendor;
     }
   }
-  console.log("Successfully loaded allowedMap with keys:", Object.keys(allowedMap));
+  console.log('Loaded allowedMap keys:', Object.keys(allowedMap));
 } catch (e) {
-  console.log("Could not load allowedVendors.json:", e.message);
+  console.error('Could not load allowedVendors.json:', e.message);
 }
 
 export function verifyDomainMiddleware(req, res, next) {
-  const incoming = (req.headers.origin || req.headers.referer || '').toLowerCase().replace(/\/+$/, '');
-  
-  console.log("Incoming request header:", incoming); // <-- Check your Render logs for this!
+  const incoming = toOrigin(req.headers.origin) || toOrigin(req.headers.referer);
 
-  // TEMPORARY BYPASS FOR LOCAL TESTING / DIRECT BROWSER URL TESTING:
-  // If no header is sent (like typing it in the browser), let it pass for now so you can test the route
   if (!incoming) {
-    console.log("No origin/referer header detected. Allowing request for testing.");
-    return next();
+    // Only allow header-less requests when explicitly enabled (local dev)
+    if (process.env.ALLOW_NO_ORIGIN === 'true') return next();
+    return res.status(403).json({ error: 'Missing origin' });
   }
 
   const matchedVendor = allowedMap[incoming];
