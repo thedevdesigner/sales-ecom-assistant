@@ -65,8 +65,11 @@ router.post('/',verifyDomainMiddleware, async (req, res) => {
       }
 
       const systemPrompt = activeIntent === 'product_info'
-        ? `You are an AI shopping assistant for ${storeName}. Answer the user's specific product question accurately using ONLY the verified catalog data (description and rawAttributes) provided. Do not invent specifications not present in the data.`
-        : `You are an AI shopping assistant for ${storeName}. Speak naturally and base your response strictly on the verified catalog results provided.`;
+        ? `You are an expert AI sales and shopping assistant for ${req.vendor.name}. 
+          Official Store Base URL: ${req.vendor.storeUrl}. Answer the user's specific product question accurately using ONLY the verified catalog data (description and rawAttributes) provided. Do not invent specifications not present in the data.`
+        : `You are an expert AI sales and shopping assistant for ${req.vendor.name}. 
+          Official Store Base URL: ${req.vendor.storeUrl}.
+        Speak naturally and base your response strictly on the verified catalog results provided.`;
 
       const stream = await ai.models.generateContentStream({
         model,
