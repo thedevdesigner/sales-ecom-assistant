@@ -3,7 +3,7 @@
      "id": "mavigadget",
     "name": "mavigadget",
     "platform": "shopify",
-    "storeUrl": "https://mavigadget.com/",
+    "storeUrl": "https://mavigadget.com",
     "allowedOrigins": ["https://mavigadgetstore.myshopify.com","https://mavigadgetstore.com/","https://www.mavigadgetstore.com"],
     "currency": "USD",
     "widgetConfig": {
