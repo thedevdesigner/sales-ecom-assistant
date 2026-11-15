@@ -1,10 +1,10 @@
 [
   {
-     "id": "nordic-knives",
-    "name": "nordic knives",
+     "id": "mavigadget",
+    "name": "mavigadget",
     "platform": "shopify",
-    "storeUrl": "https://nordicknives.com/",
-    "allowedOrigins": ["https://nordic-knives.myshopify.com","https://nordicknives.com/","https://www.nordicknives.com"],
+    "storeUrl": "https://mavigadget.com/",
+    "allowedOrigins": ["https://mavigadgetstore.myshopify.com","https://mavigadgetstore.com/","https://www.mavigadgetstore.com"],
     "currency": "USD",
     "widgetConfig": {
       "title": "AI Shopping Assistant",
