@@ -1,10 +1,10 @@
 [
   {
-     "id": "mavigadget",
-    "name": "mavigadget",
+     "id": "smalldog",
+    "name": "smalldog",
     "platform": "shopify",
-    "storeUrl": "https://mavigadget.com",
-    "allowedOrigins": ["https://mavigadgetstore.myshopify.com","https://mavigadgetstore.com","https://www.mavigadgetstore.com"],
+    "storeUrl": "https://smalldog.com/",
+    "allowedOrigins": ["https://small-dog-electronics-sde.myshopify.com","https://smalldog.com","https://www.smalldog.com"],
     "currency": "USD",
     "widgetConfig": {
       "title": "AI Shopping Assistant",
